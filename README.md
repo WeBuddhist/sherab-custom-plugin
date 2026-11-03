@@ -2,13 +2,14 @@
 
 Custom Open edX plugins for the **Sherab / WeBuddhist Academy** platform, packaged
 together as a single installable distribution (`custom-extensions`). The package
-bundles five independent Django apps that plug into the LMS and/or CMS via the
+bundles six independent Django apps that plug into the LMS and/or CMS via the
 [Open edX plugin framework](https://edx.readthedocs.io/projects/edx-django-utils/en/latest/edx_django_utils.plugins.html)
 (`edx_django_utils.plugins`) — no edx-platform core code is modified.
 
 | App | Runs in | Purpose |
 | --- | --- | --- |
 | [`ai_course_creator`](#ai_course_creator) | CMS (Studio) | Conversational AI ("Sherab") that designs and generates whole courses, and edits existing sections, using Google Gemini. |
+| [`course_from_recording`](#course_from_recording) | CMS (Studio) | Jobs for the "From a teaching recording" tool: upload links, the studio tool service's queue, and progress. |
 | [`course_schedule`](#course_schedule) | LMS + CMS | Per-section schedule (dates, times, instructor, tools, notes) set in the Studio outline and shown on the learner Dates tab. |
 | [`course_partnerships`](#course_partnerships) | LMS | Partner organizations, centers, categories, and course-creator profiles, with branding assets and a mobile API. |
 | [`user_extension`](#user_extension) | LMS | Extends user profiles with partner relationships; auto-approves ID verification on registration. |
@@ -37,7 +38,7 @@ and installed automatically by `setup.py`.
 The apps register through the entry points in [`setup.py`](setup.py):
 
 ```
-cms.djangoapp:  ai_course_creator, course_partnerships, course_schedule, user_extension
+cms.djangoapp:  ai_course_creator, course_from_recording, course_partnerships, course_schedule, user_extension
 lms.djangoapp:  course_partnerships, course_schedule, user_extension, wishlist
 ```
 
@@ -176,6 +177,81 @@ then `tutor config save` and restart CMS.
 
 The matching frontend lives in the **`frontend-app-authoring`** MFE under
 `src/ai-course-creator/` (the creator modal and the section-editor sidebar).
+
+---
+
+## `course_from_recording`
+
+**CMS-only.** The Studio side of the "From a teaching recording" tool. A course
+author uploads a teaching recording, and the **studio tool service** (a separate
+container from the `wb-academy-studio-tool-service` repo) cleans it, finds the
+speakers and transcribes it in the background. The heavy audio work never runs
+inside Open edX; this app only keeps track of the jobs.
+
+- **Uploads go straight to S3.** The API returns a signed upload link for one file,
+  with its content type and size in the signature, so the recording never passes
+  through Studio and S3 refuses any other file.
+- **Files** live in the private Open edX bucket under
+  `studio-tools/course-from-recording/<job id>/`.
+- **Queue:** starting a job pushes `course_from_recording:<job id>` onto the
+  service's Redis list. The service trusts only the id and reads the rest from
+  this app, so a queue entry this app didn't create leads nowhere.
+
+### Models
+
+- `RecordingJob`: one row per recording. Random UUID id (also its S3 folder),
+  course, user, `status` (`uploading` → `queued` → `cleaning` → `finding_speakers` →
+  `transcribing` → `transcript_ready`, or `failed`), `progress` (0-100 for the current
+  step), `error`, the author's `metadata` (teacher, text, languages, place, year), the
+  declared file name, type and size, `duration_seconds`, `transcribed_minutes` (Monlam
+  cost tracking), and `results` (output name → path inside the job folder).
+
+### Components
+
+- `services.py`: everything that leaves Open edX: signed S3 links, checking the
+  upload, and the Redis queue.
+- `views.py`: the Studio API for the studio-extension MFE. Course authors only.
+- `views_service.py`: the service's API. No user login: every request needs the
+  shared secret in the `X-Service-Token` header, compared in constant time. The
+  service may only report its own steps, only while a job is queued or running,
+  and only output paths inside the job's folder.
+
+### API endpoints
+
+| Who | Method | Path | Purpose |
+| --- | --- | --- | --- |
+| Author | POST | `/api/course-from-recording/v1/jobs/` | Create a job: `{course_id, filename, content_type, size, consent, details: {teacher, text?, languages?, place?, year?}}`. Returns the job and `upload: {method, url, headers}`. |
+| Author | GET | `/api/course-from-recording/v1/jobs/?course_id=...` | The course's latest job, or `null`, so the tool page can resume. |
+| Author | GET | `/api/course-from-recording/v1/jobs/<id>/` | One job, with short-lived `downloads` links to its outputs. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/start/` | Check the upload is in S3 with the declared size, then queue the job. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/retry/` | Queue a failed job again; the service continues from the step that failed. |
+| Service | GET | `/api/course-from-recording/v1/service/jobs/<id>/` | Job details, its S3 folder and the recording's key. |
+| Service | PATCH | `/api/course-from-recording/v1/service/jobs/<id>/` | Progress report: any of `status`, `progress`, `error`, `results` (merged), `duration_seconds`, `transcribed_minutes`. |
+
+### Settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `STUDIO_TOOL_SERVICE` | `{}` | `REDIS_URL`, `QUEUE`, `BUCKET`, `PREFIX`, `TOKEN`, `MAX_RECORDING_MINUTES`. Set by the `studio_tool_service` Tutor plugin; while it is incomplete the author API answers 503. |
+| `COURSE_FROM_RECORDING_MAX_UPLOAD_MB` | `2048` | Largest recording an author can upload. |
+
+S3 access uses Studio's own settings and key from `tutor-contrib-s3`
+(`AWS_S3_REGION_NAME`, `AWS_ACCESS_KEY_ID`, ...). The bucket's CORS rule must allow
+`PUT` from the MFE host.
+
+### Frontend
+
+- Entry point: the "Create with a tool" menu in the empty course outline
+  (`frontend-app-authoring` `src/plugin-slots/CourseOutlineCreateToolsSlot/` and
+  `src/plugins/RecordingCourseTool/`).
+- Tool page: `frontend-app-studio-extension`, route `/course-from-recording/:courseId`.
+
+### Tests
+
+```bash
+tutor dev exec cms python -m pytest -c cms/pytest.ini --ds=cms.envs.test --rootdir=/openedx/edx-platform -p conftest \
+    /mnt/sherab-custom-plugin/course_from_recording/tests/
+```
 
 ---
 
