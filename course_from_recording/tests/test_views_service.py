@@ -28,7 +28,7 @@ class ServiceJobAPITest(TestCase):
         self.job = RecordingJob.objects.create(
             course_id=CourseKey.from_string("course-v1:Sherab+tspc12+2026"),
             status="queued",
-            metadata={"teacher": "Geshe Tenzin"},
+            metadata={"teacher": "Geshe Tenzin", "multiple_speakers": True},
             original_filename="teaching.wav",
             content_type="audio/wav",
             file_size=1000,
@@ -55,7 +55,7 @@ class ServiceJobAPITest(TestCase):
 
         assert response.status_code == 200
         assert response.data["course_id"] == "course-v1:Sherab+tspc12+2026"
-        assert response.data["details"] == {"teacher": "Geshe Tenzin"}
+        assert response.data["details"] == {"teacher": "Geshe Tenzin", "multiple_speakers": True}
         assert response.data["folder"] == f"studio-tools/course-from-recording/{self.job.id}"
         assert response.data["original_key"] == f"studio-tools/course-from-recording/{self.job.id}/original.wav"
 
@@ -99,3 +99,45 @@ class ServiceJobAPITest(TestCase):
             self.job.status = job_status
             self.job.save()
             assert self.patch({"progress": 10}).status_code == 409, job_status
+
+    # Tagging the voices
+
+    def groups(self):
+        return [
+            {"group": "1", "minutes": 95.5, "samples": ["speakers/1-a.mp3", "speakers/1-b.mp3"]},
+            {"group": "2", "minutes": 80.0, "samples": ["speakers/2-a.mp3"]},
+        ]
+
+    def test_pausing_for_the_author_to_tag_the_voices(self):
+        response = self.patch({"status": "needs_speaker_labels", "speaker_groups": self.groups()})
+
+        assert response.status_code == 200
+        self.job.refresh_from_db()
+        assert self.job.status == "needs_speaker_labels"
+        assert self.job.speaker_groups == self.groups()
+        # The job has left the queue: the service can't report on it until the author has tagged the voices.
+        assert self.patch({"progress": 10}).status_code == 409
+
+    def test_pausing_needs_the_groups(self):
+        assert self.patch({"status": "needs_speaker_labels"}).status_code == 400
+
+    def test_one_speaker_recordings_never_pause(self):
+        self.job.metadata = {"teacher": "Geshe Tenzin", "multiple_speakers": False}
+        self.job.save()
+        assert self.patch({"status": "needs_speaker_labels", "speaker_groups": self.groups()}).status_code == 400
+
+    def test_samples_must_stay_inside_the_job_folder(self):
+        groups = [{"group": "1", "minutes": 1, "samples": ["../other-job/clip.mp3"]}]
+        assert self.patch({"status": "needs_speaker_labels", "speaker_groups": groups}).status_code == 400
+
+    def test_group_names_must_be_unique(self):
+        groups = [
+            {"group": "1", "minutes": 1, "samples": ["a.mp3"]},
+            {"group": "1", "minutes": 2, "samples": ["b.mp3"]},
+        ]
+        assert self.patch({"status": "needs_speaker_labels", "speaker_groups": groups}).status_code == 400
+
+    def test_get_includes_the_authors_tags(self):
+        self.job.speaker_labels = {"1": "teacher", "2": "translator"}
+        self.job.save()
+        assert self.client.get(self.url()).data["speaker_labels"] == {"1": "teacher", "2": "translator"}

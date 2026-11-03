@@ -51,7 +51,13 @@ class StudioJobsAPITest(ModuleStoreTestCase):
             "content_type": "audio/mpeg",
             "size": 50 * 1024 * 1024,
             "consent": True,
-            "details": {"teacher": "Geshe Tenzin", "text": "Bodhicaryavatara", "languages": ["bo", "lad"]},
+            "details": {
+                "teacher": "Geshe Tenzin",
+                "multiple_speakers": True,
+                "teacher_language": "bo",
+                "translator_language": "Ladakhi",
+                "text": "Bodhicaryavatara",
+            },
         }
         payload.update(changes)
         return payload
@@ -104,8 +110,36 @@ class StudioJobsAPITest(ModuleStoreTestCase):
         assert not RecordingJob.objects.exists()
 
     def test_create_needs_consent_and_a_teacher(self):
+        details = self.create_payload()["details"]
         assert self.create(consent=False).status_code == 400
-        assert self.create(details={"text": "No teacher"}).status_code == 400
+        assert self.create(details={**details, "teacher": ""}).status_code == 400
+
+    def test_create_needs_the_speakers_and_the_teachers_language(self):
+        details = self.create_payload()["details"]
+        for missing in ("multiple_speakers", "teacher_language"):
+            without = {key: value for key, value in details.items() if key != missing}
+            assert self.create(details=without).status_code == 400, missing
+
+    def test_only_tibetan_and_english_teachers_are_supported(self):
+        details = self.create_payload()["details"]
+        response = self.create(details={**details, "teacher_language": "hi"})
+
+        assert response.status_code == 400
+        assert response.data["details"]["teacher_language"] == [
+            "Only Tibetan and English recordings are supported for now."
+        ]
+        assert self.create(details={**details, "teacher_language": "en"}).status_code == 201
+
+    def test_one_speaker_has_no_translator(self):
+        details = self.create_payload()["details"]
+        self.create(details={**details, "multiple_speakers": False})
+
+        assert RecordingJob.objects.get().metadata == {
+            "teacher": "Geshe Tenzin",
+            "multiple_speakers": False,
+            "teacher_language": "bo",
+            "text": "Bodhicaryavatara",
+        }
 
     def test_create_rejects_files_over_the_size_limit(self):
         response = self.create(size=101 * 1024 * 1024)
@@ -206,3 +240,66 @@ class StudioJobsAPITest(ModuleStoreTestCase):
     def test_only_failed_jobs_can_be_retried(self):
         job = self.make_job(status="transcribing")
         assert self.post_action("job-retry", job).status_code == 409
+
+    # Tagging the voices
+
+    def waiting_job(self):
+        return self.make_job(
+            status="needs_speaker_labels",
+            metadata={"teacher": "Geshe Tenzin", "multiple_speakers": True, "teacher_language": "bo"},
+            speaker_groups=[
+                {"group": "1", "minutes": 95.5, "samples": ["speakers/1-a.mp3"]},
+                {"group": "2", "minutes": 80.0, "samples": ["speakers/2-a.mp3", "speakers/2-b.mp3"]},
+                {"group": "3", "minutes": 4.0, "samples": ["speakers/3-a.mp3"]},
+            ],
+        )
+
+    def tag(self, job, labels):
+        url = reverse("course_from_recording:job-speakers", kwargs={"job_id": job.id})
+        return self.client.post(url, {"labels": labels}, format="json")
+
+    def test_job_lists_the_voices_with_links_to_their_samples(self):
+        job = self.waiting_job()
+
+        groups = self.client.get(reverse("course_from_recording:job", kwargs={"job_id": job.id})).data["job"][
+            "speaker_groups"
+        ]
+
+        assert [(group["group"], group["minutes"]) for group in groups] == [("1", 95.5), ("2", 80.0), ("3", 4.0)]
+        assert groups[1]["samples"] == ["https://s3.example/signed", "https://s3.example/signed"]
+        keys = [call.kwargs["Params"]["Key"] for call in self.s3.generate_presigned_url.call_args_list]
+        assert f"studio-tools/course-from-recording/{job.id}/speakers/2-b.mp3" in keys
+
+    def test_tagging_the_voices_queues_the_job_again(self):
+        job = self.waiting_job()
+
+        response = self.tag(job, {"1": "teacher", "2": "translator", "3": "chanting"})
+
+        assert response.status_code == 200
+        job.refresh_from_db()
+        assert job.status == "queued"
+        assert job.speaker_labels == {"1": "teacher", "2": "translator", "3": "chanting"}
+        self.redis.lpush.assert_called_once_with("studio_tool_service:jobs", f"course_from_recording:{job.id}")
+
+    def test_the_same_voice_split_in_two_can_both_be_the_teacher(self):
+        job = self.waiting_job()
+        assert self.tag(job, {"1": "teacher", "2": "teacher", "3": "other"}).status_code == 200
+
+    def test_every_voice_needs_a_tag(self):
+        job = self.waiting_job()
+        assert self.tag(job, {"1": "teacher", "2": "translator"}).status_code == 400
+        assert self.tag(job, {"1": "teacher", "2": "translator", "3": "other", "9": "other"}).status_code == 400
+
+    def test_at_least_one_voice_is_the_teacher(self):
+        job = self.waiting_job()
+        response = self.tag(job, {"1": "translator", "2": "translator", "3": "chanting"})
+        assert response.status_code == 400
+        assert response.data["labels"] == ["Tag at least one voice as the teacher."]
+
+    def test_only_known_tags(self):
+        job = self.waiting_job()
+        assert self.tag(job, {"1": "teacher", "2": "audience", "3": "other"}).status_code == 400
+
+    def test_tagging_only_when_the_job_is_waiting_for_it(self):
+        job = self.make_job(status="transcribing")
+        assert self.tag(job, {"1": "teacher"}).status_code == 409

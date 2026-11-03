@@ -91,19 +91,32 @@ def uploaded_size(job):
     return head["ContentLength"]
 
 
+def _file_url(client, job, path):
+    """A short-lived link to one file in the job's folder."""
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": tool_settings()["BUCKET"], "Key": f"{job_folder(job)}/{path}"},
+        ExpiresIn=DOWNLOAD_URL_SECONDS,
+    )
+
+
 def download_urls(job):
     """Short-lived links to the service's outputs, e.g. {"transcript": "https://..."}."""
     if not job.results:
         return {}
     client = s3_client()
-    bucket = tool_settings()["BUCKET"]
-    folder = job_folder(job)
-    return {
-        name: client.generate_presigned_url(
-            "get_object", Params={"Bucket": bucket, "Key": f"{folder}/{path}"}, ExpiresIn=DOWNLOAD_URL_SECONDS
-        )
-        for name, path in job.results.items()
-    }
+    return {name: _file_url(client, job, path) for name, path in job.results.items()}
+
+
+def speaker_groups_with_urls(job):
+    """The voices the service found, with links to their sample clips for the author to listen to."""
+    if not job.speaker_groups:
+        return []
+    client = s3_client()
+    return [
+        {**group, "samples": [_file_url(client, job, path) for path in group["samples"]]}
+        for group in job.speaker_groups
+    ]
 
 
 def enqueue(job):

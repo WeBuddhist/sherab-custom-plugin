@@ -53,6 +53,8 @@ class ServiceJobView(APIView):
                 "folder": services.job_folder(job),
                 "original_key": services.original_key(job),
                 "results": job.results,
+                "speaker_groups": job.speaker_groups,
+                "speaker_labels": job.speaker_labels,
             }
         )
 
@@ -68,6 +70,17 @@ class ServiceJobView(APIView):
         serializer = ServiceUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        if data.get("status") == RecordingJob.Status.NEEDS_SPEAKER_LABELS:
+            if not job.metadata.get("multiple_speakers"):
+                return Response(
+                    {"error": _("The author said this recording has only one speaker.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not data.get("speaker_groups", job.speaker_groups):
+                return Response(
+                    {"error": _("Send the speaker groups for the author to tag.")}, status=status.HTTP_400_BAD_REQUEST
+                )
 
         # Outputs are added step by step, so new ones are merged with the earlier ones.
         if "results" in data:

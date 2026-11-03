@@ -5,6 +5,7 @@ Studio API for the "From a teaching recording" tool, used by the studio-extensio
     GET  api/course-from-recording/v1/jobs/?course_id=...   -> the course's latest job, or null
     GET  api/course-from-recording/v1/jobs/<id>/            -> one job, with links to its outputs
     POST api/course-from-recording/v1/jobs/<id>/start/      -> check the upload is in S3, then queue it
+    POST api/course-from-recording/v1/jobs/<id>/speakers/   -> tag the voices the service found, then queue it
     POST api/course-from-recording/v1/jobs/<id>/retry/      -> queue a failed job again
 
 Course authors only. The studio tool service's own endpoint is in views_service.py.
@@ -27,7 +28,7 @@ from xmodule.modulestore.django import modulestore
 
 from . import services
 from .models import RecordingJob
-from .serializers import JobCreateSerializer
+from .serializers import JobCreateSerializer, SpeakerLabelsSerializer
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,8 @@ def serialize_job(job):
         "file_size": job.file_size,
         "duration_seconds": job.duration_seconds,
         "downloads": services.download_urls(job),
+        "speaker_groups": services.speaker_groups_with_urls(job),
+        "speaker_labels": job.speaker_labels,
         "created": job.created.isoformat(),
         "modified": job.modified.isoformat(),
     }
@@ -174,6 +177,24 @@ class JobStartView(AuthorAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
         return self.queue(job, from_status=RecordingJob.Status.UPLOADING)
+
+
+class JobSpeakersView(AuthorAPIView):
+    """The author's tags for the voices the service found; the job then continues with transcription."""
+
+    def post(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        if job.status != RecordingJob.Status.NEEDS_SPEAKER_LABELS:
+            return Response(
+                {"error": _("This job is not waiting for the voices to be tagged.")}, status=status.HTTP_409_CONFLICT
+            )
+        serializer = SpeakerLabelsSerializer(data=request.data, context={"speaker_groups": job.speaker_groups})
+        serializer.is_valid(raise_exception=True)
+        job.speaker_labels = serializer.validated_data["labels"]
+        job.save(update_fields=["speaker_labels", "modified"])
+        return self.queue(job, from_status=RecordingJob.Status.NEEDS_SPEAKER_LABELS)
 
 
 class JobRetryView(AuthorAPIView):

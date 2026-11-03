@@ -185,7 +185,8 @@ The matching frontend lives in the **`frontend-app-authoring`** MFE under
 **CMS-only.** The Studio side of the "From a teaching recording" tool. A course
 author uploads a teaching recording, and the **studio tool service** (a separate
 container from the `wb-academy-studio-tool-service` repo) cleans it, finds the
-speakers and transcribes it in the background. The heavy audio work never runs
+speakers and transcribes it in the background. With more than one speaker (a
+teacher and a translator) only the teacher is transcribed; with one, the whole recording. The heavy audio work never runs
 inside Open edX; this app only keeps track of the jobs.
 
 - **Uploads go straight to S3.** The API returns a signed upload link for one file,
@@ -200,11 +201,18 @@ inside Open edX; this app only keeps track of the jobs.
 ### Models
 
 - `RecordingJob`: one row per recording. Random UUID id (also its S3 folder),
-  course, user, `status` (`uploading` → `queued` → `cleaning` → `finding_speakers` →
-  `transcribing` → `transcript_ready`, or `failed`), `progress` (0-100 for the current
-  step), `error`, the author's `metadata` (teacher, text, languages, place, year), the
-  declared file name, type and size, `duration_seconds`, `transcribed_minutes` (Monlam
-  cost tracking), and `results` (output name → path inside the job folder).
+  course, user, `status`, `progress` (0-100 for the current step), `error`, the
+  author's `metadata` (teacher, `multiple_speakers`, `teacher_language`,
+  `translator_language`, text, place, year), the declared file name, type and size,
+  `duration_seconds`, `transcribed_minutes` (Monlam and Gemini cost tracking),
+  `results` (output name → path inside the job folder), and for recordings with more
+  than one speaker `speaker_groups` (the voices the service found, with sample clips)
+  and `speaker_labels` (the author's tag for each: teacher, translator, chanting, other).
+
+  Statuses: `uploading` → `queued` → `cleaning` → `finding_speakers` →
+  `needs_speaker_labels` → `queued` → `transcribing` → `transcript_ready`, or `failed`.
+  One-speaker recordings skip `finding_speakers` and `needs_speaker_labels`. While a
+  job waits for the author's tags it is off the queue; tagging puts it back.
 
 ### Components
 
@@ -220,13 +228,14 @@ inside Open edX; this app only keeps track of the jobs.
 
 | Who | Method | Path | Purpose |
 | --- | --- | --- | --- |
-| Author | POST | `/api/course-from-recording/v1/jobs/` | Create a job: `{course_id, filename, content_type, size, consent, details: {teacher, text?, languages?, place?, year?}}`. Returns the job and `upload: {method, url, headers}`. |
+| Author | POST | `/api/course-from-recording/v1/jobs/` | Create a job: `{course_id, filename, content_type, size, consent, details: {teacher, multiple_speakers, teacher_language, translator_language?, text?, place?, year?}}`. `teacher_language` must be `bo` (Tibetan, transcribed by Monlam AI) or `en` (English, transcribed by Gemini); anything else is refused as not supported yet. Returns the job and `upload: {method, url, headers}`. |
 | Author | GET | `/api/course-from-recording/v1/jobs/?course_id=...` | The course's latest job, or `null`, so the tool page can resume. |
-| Author | GET | `/api/course-from-recording/v1/jobs/<id>/` | One job, with short-lived `downloads` links to its outputs. |
+| Author | GET | `/api/course-from-recording/v1/jobs/<id>/` | One job, with short-lived `downloads` links to its outputs and to each speaker group's sample clips. |
 | Author | POST | `/api/course-from-recording/v1/jobs/<id>/start/` | Check the upload is in S3 with the declared size, then queue the job. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/speakers/` | Tag the voices: `{labels: {group: "teacher" \| "translator" \| "chanting" \| "other"}}`. Every group needs a tag and at least one must be the teacher (one voice is sometimes split into two groups). Queues the job again. |
 | Author | POST | `/api/course-from-recording/v1/jobs/<id>/retry/` | Queue a failed job again; the service continues from the step that failed. |
-| Service | GET | `/api/course-from-recording/v1/service/jobs/<id>/` | Job details, its S3 folder and the recording's key. |
-| Service | PATCH | `/api/course-from-recording/v1/service/jobs/<id>/` | Progress report: any of `status`, `progress`, `error`, `results` (merged), `duration_seconds`, `transcribed_minutes`. |
+| Service | GET | `/api/course-from-recording/v1/service/jobs/<id>/` | Job details, its S3 folder, the recording's key, and the speaker groups and the author's tags. |
+| Service | PATCH | `/api/course-from-recording/v1/service/jobs/<id>/` | Progress report: any of `status`, `progress`, `error`, `results` (merged), `duration_seconds`, `transcribed_minutes`, `speaker_groups`. `needs_speaker_labels` is accepted only for multi-speaker recordings and with the groups. |
 
 ### Settings
 

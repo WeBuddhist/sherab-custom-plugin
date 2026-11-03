@@ -34,6 +34,7 @@ class RecordingJob(TimeStampedModel):
         QUEUED = "queued", _("Waiting to start")
         CLEANING = "cleaning", _("Cleaning the audio")
         FINDING_SPEAKERS = "finding_speakers", _("Finding the speakers")
+        NEEDS_SPEAKER_LABELS = "needs_speaker_labels", _("Waiting for you to tag the voices")
         TRANSCRIBING = "transcribing", _("Transcribing")
         TRANSCRIPT_READY = "transcript_ready", _("Transcript ready")
         FAILED = "failed", _("Failed")
@@ -46,14 +47,28 @@ class RecordingJob(TimeStampedModel):
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.UPLOADING)
     progress = models.PositiveSmallIntegerField(default=0, help_text=_("0-100, for the current step."))
     error = models.TextField(blank=True, default="", help_text=_("Shown to the author when a step fails."))
-    metadata = models.JSONField(default=dict, blank=True, help_text=_("Teacher, text, languages, place, year."))
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_("What the author entered: teacher, speakers, languages, text, place, year."),
+    )
     original_filename = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100)
     file_size = models.PositiveBigIntegerField(help_text=_("Bytes, as declared before the upload."))
     duration_seconds = models.FloatField(null=True, blank=True)
-    transcribed_minutes = models.FloatField(default=0, help_text=_("Minutes sent to Monlam, for cost tracking."))
+    transcribed_minutes = models.FloatField(
+        default=0, help_text=_("Minutes sent for transcription (Monlam or Gemini), for cost tracking.")
+    )
     results = models.JSONField(
         default=dict, blank=True, help_text=_("Output name -> path inside the job's S3 folder, set by the service.")
+    )
+    # Recordings with more than one speaker: the service splits the voices into groups by itself and
+    # pauses the job; the author listens to each group's samples and tags it, and the job continues.
+    speaker_groups = models.JSONField(
+        default=list, blank=True, help_text=_("Set by the service: [{group, minutes, samples: [path, ...]}, ...].")
+    )
+    speaker_labels = models.JSONField(
+        default=dict, blank=True, help_text=_("Set by the author: group -> teacher, translator, chanting or other.")
     )
 
     class Meta:
@@ -72,12 +87,14 @@ class RecordingJob(TimeStampedModel):
 SERVICE_STATUSES = (
     RecordingJob.Status.CLEANING,
     RecordingJob.Status.FINDING_SPEAKERS,
+    RecordingJob.Status.NEEDS_SPEAKER_LABELS,
     RecordingJob.Status.TRANSCRIBING,
     RecordingJob.Status.TRANSCRIPT_READY,
     RecordingJob.Status.FAILED,
 )
 
-# The service may only update a job while it is queued or running.
+# The service may only update a job while it is queued or running. A job waiting for the author's
+# speaker labels is neither: it leaves the queue and comes back once the author has tagged the voices.
 ACTIVE_STATUSES = (
     RecordingJob.Status.QUEUED,
     RecordingJob.Status.CLEANING,
