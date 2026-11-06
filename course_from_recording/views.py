@@ -2,7 +2,7 @@
 Studio API for the "From a teaching recording" tool, used by the studio-extension MFE.
 
     POST api/course-from-recording/v1/jobs/                 -> create a job, returns an S3 upload link
-    GET  api/course-from-recording/v1/jobs/?course_id=...   -> the course's latest job, or null
+    GET  api/course-from-recording/v1/jobs/?course_id=...   -> the course's latest job (or null), and the upload limit
     GET  api/course-from-recording/v1/jobs/<id>/            -> one job, with links to its outputs
     POST api/course-from-recording/v1/jobs/<id>/start/      -> check the upload is in S3, then queue it
     POST api/course-from-recording/v1/jobs/<id>/speakers/   -> tag the voices the service found, then queue it
@@ -20,6 +20,7 @@ import logging
 
 import redis
 from botocore.exceptions import BotoCoreError, ClientError
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from django.utils.translation import gettext as _
@@ -146,7 +147,10 @@ class JobsView(AuthorAPIView):
         if not has_course_author_access(request.user, course_key):
             return forbidden_response()
         job = RecordingJob.objects.filter(course_id=course_key).first()
-        return Response({"job": serialize_job(job) if job else None})
+        # The upload limit too, so the tool page checks a file against the same limit Studio does.
+        return Response(
+            {"job": serialize_job(job) if job else None, "max_upload_mb": settings.COURSE_FROM_RECORDING_MAX_UPLOAD_MB}
+        )
 
     def post(self, request):
         serializer = JobCreateSerializer(data=request.data)

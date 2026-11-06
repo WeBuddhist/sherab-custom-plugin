@@ -174,7 +174,7 @@ class StudioJobsAPITest(ModuleStoreTestCase):
 
     def test_latest_job_of_the_course(self):
         url = reverse("course_from_recording:jobs")
-        assert self.client.get(url, {"course_id": str(self.course.id)}).data == {"job": None}
+        assert self.client.get(url, {"course_id": str(self.course.id)}).data == {"job": None, "max_upload_mb": 100}
 
         self.make_job(original_filename="old.mp3")
         newer = self.make_job(original_filename="new.mp3")
