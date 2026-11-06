@@ -56,8 +56,13 @@ class ServiceJobAPITest(TestCase):
         assert response.status_code == 200
         assert response.data["course_id"] == "course-v1:Sherab+tspc12+2026"
         assert response.data["details"] == {"teacher": "Geshe Tenzin", "multiple_speakers": True}
-        assert response.data["folder"] == f"studio-tools/course-from-recording/{self.job.id}"
-        assert response.data["original_key"] == f"studio-tools/course-from-recording/{self.job.id}/original.wav"
+        folder = (
+            "studio-tools/course-from-recording/Sherab-tspc12-2026/"
+            f"{self.job.created:%Y-%m-%d}_teaching_{self.job.id.hex[:8]}"
+        )
+        assert response.data["folder"] == folder
+        assert response.data["original_key"] == f"{folder}/0-original/teaching.wav"
+        assert response.data["transcribed_minutes"] == 0
 
     def test_unknown_job(self):
         assert self.client.get(self.url(uuid.uuid4())).status_code == 404
@@ -100,12 +105,30 @@ class ServiceJobAPITest(TestCase):
             self.job.save()
             assert self.patch({"progress": 10}).status_code == 409, job_status
 
+    def test_a_job_the_author_started_over_tells_the_service_to_stop(self):
+        self.job.status = "cancelled"
+        self.job.save()
+
+        response = self.patch({"progress": 10})
+
+        assert response.status_code == 409
+        assert response.data["status"] == "cancelled"
+
+    def test_minutes_already_paid_for_are_still_recorded_after_starting_over(self):
+        self.job.status = "cancelled"
+        self.job.save()
+
+        assert self.patch({"transcribed_minutes": 7.5}).status_code == 200
+        assert self.patch({"transcribed_minutes": 8, "progress": 50}).status_code == 409
+        self.job.refresh_from_db()
+        assert (self.job.transcribed_minutes, self.job.status) == (7.5, "cancelled")
+
     # Tagging the voices
 
     def groups(self):
         return [
-            {"group": "1", "minutes": 95.5, "samples": ["speakers/1-a.mp3", "speakers/1-b.mp3"]},
-            {"group": "2", "minutes": 80.0, "samples": ["speakers/2-a.mp3"]},
+            {"group": "1", "minutes": 95.5, "samples": ["1-voices/samples/voice-1_sample-1.mp3", "1-voices/samples/voice-1_sample-2.mp3"]},
+            {"group": "2", "minutes": 80.0, "samples": ["1-voices/samples/voice-2_sample-1.mp3"]},
         ]
 
     def test_pausing_for_the_author_to_tag_the_voices(self):

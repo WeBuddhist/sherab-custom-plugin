@@ -38,6 +38,9 @@ class RecordingJob(TimeStampedModel):
         TRANSCRIBING = "transcribing", _("Transcribing")
         TRANSCRIPT_READY = "transcript_ready", _("Transcript ready")
         FAILED = "failed", _("Failed")
+        # The author started over: the job stopped and its files were deleted (the recording too,
+        # unless recording_kept). It stays as a record, e.g. of the minutes already transcribed.
+        CANCELLED = "cancelled", _("Started over")
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     course_id = CourseKeyField(max_length=255, db_index=True)
@@ -55,6 +58,9 @@ class RecordingJob(TimeStampedModel):
     original_filename = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100)
     file_size = models.PositiveBigIntegerField(help_text=_("Bytes, as declared before the upload."))
+    folder = models.CharField(
+        max_length=512, blank=True, default="", help_text=_("The job's S3 folder, chosen once when it is created.")
+    )
     duration_seconds = models.FloatField(null=True, blank=True)
     transcribed_minutes = models.FloatField(
         default=0, help_text=_("Minutes sent for transcription (Monlam or Gemini), for cost tracking.")
@@ -70,12 +76,28 @@ class RecordingJob(TimeStampedModel):
     speaker_labels = models.JSONField(
         default=dict, blank=True, help_text=_("Set by the author: group -> teacher, translator, chanting or other.")
     )
+    recording_kept = models.BooleanField(
+        default=False,
+        help_text=_("Started over keeping the recording: it is still in S3, for the next job to reuse."),
+    )
+    # The service's transcript (3-transcript/transcript.json) is never rewritten; the author's corrections
+    # are kept here, by line number, and laid over it wherever the transcript is used.
+    transcript_edits = models.JSONField(
+        default=dict, blank=True, help_text=_("Set by the author: line number -> corrected text.")
+    )
 
     class Meta:
         ordering = ["-created"]
 
     def __str__(self):
         return f"{self.course_id} {self.original_filename} ({self.status})"
+
+    def save(self, *args, **kwargs):
+        if not self.folder:
+            from . import services  # services builds the folder name from the tool's settings
+
+            self.folder = services.new_job_folder(self)
+        super().save(*args, **kwargs)
 
     @property
     def extension(self):

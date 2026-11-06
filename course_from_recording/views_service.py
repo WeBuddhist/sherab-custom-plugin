@@ -13,6 +13,7 @@ X-Service-Token header; there is no user login.
 import hmac
 
 from django.conf import settings
+from django.db import transaction
 from django.utils.translation import gettext as _
 from rest_framework import status
 from rest_framework.permissions import BasePermission
@@ -55,16 +56,30 @@ class ServiceJobView(APIView):
                 "results": job.results,
                 "speaker_groups": job.speaker_groups,
                 "speaker_labels": job.speaker_labels,
+                "transcribed_minutes": job.transcribed_minutes,
+                "transcript_edits": job.transcript_edits,
             }
         )
 
+    # Locked from reading the job to saving it, so a report can't undo a start-over the author makes at
+    # the same moment (it waits, then sees the job is cancelled).
+    @transaction.atomic
     def patch(self, request, job_id):
-        job = RecordingJob.objects.filter(id=job_id).first()
+        job = RecordingJob.objects.select_for_update().filter(id=job_id).first()
         if job is None:
             return Response({"error": _("Job not found.")}, status=status.HTTP_404_NOT_FOUND)
+        if job.status == RecordingJob.Status.CANCELLED and set(request.data) == {"transcribed_minutes"}:
+            # The author started over during transcription: the minutes already sent were paid for, so the
+            # service's last count is still kept, for cost tracking.
+            serializer = ServiceUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            job.transcribed_minutes = serializer.validated_data["transcribed_minutes"]
+            job.save(update_fields=["transcribed_minutes", "modified"])
+            return Response({"status": job.status})
         if job.status not in ACTIVE_STATUSES:
             return Response(
-                {"error": _("The job is {status}; it is not running.").format(status=job.status)},
+                # The service stops on this; "cancelled" tells it the author started over.
+                {"error": _("The job is {status}; it is not running.").format(status=job.status), "status": job.status},
                 status=status.HTTP_409_CONFLICT,
             )
         serializer = ServiceUpdateSerializer(data=request.data)

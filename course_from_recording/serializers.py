@@ -73,6 +73,26 @@ class JobCreateSerializer(serializers.Serializer):
         return value
 
 
+class TranscriptEditSerializer(serializers.Serializer):
+    """One corrected line of the transcript; ``text: null`` puts the line back as it was written down."""
+
+    line = serializers.IntegerField(min_value=0, max_value=100000)
+    text = serializers.CharField(max_length=5000, allow_null=True, allow_blank=False, trim_whitespace=True)
+
+
+class StartOverSerializer(serializers.Serializer):
+    keep_recording = serializers.BooleanField(default=True)
+
+
+class ReuseRecordingSerializer(serializers.Serializer):
+    """A new job for a kept recording: the details again (the author may have changed them)."""
+
+    consent = serializers.BooleanField()
+    details = RecordingDetailsSerializer()
+
+    validate_consent = JobCreateSerializer.validate_consent
+
+
 def validate_result_path(path):
     """A path inside the job's S3 folder, e.g. 'transcript/corrected.txt'; nothing that climbs out of it."""
     normalised = posixpath.normpath(path)

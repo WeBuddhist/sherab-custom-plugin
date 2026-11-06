@@ -7,6 +7,11 @@ Studio API for the "From a teaching recording" tool, used by the studio-extensio
     POST api/course-from-recording/v1/jobs/<id>/start/      -> check the upload is in S3, then queue it
     POST api/course-from-recording/v1/jobs/<id>/speakers/   -> tag the voices the service found, then queue it
     POST api/course-from-recording/v1/jobs/<id>/retry/      -> queue a failed job again
+    POST api/course-from-recording/v1/jobs/<id>/transcript-edits/ -> save the author's correction of one line
+    POST api/course-from-recording/v1/jobs/<id>/start-over/ -> stop the job and delete its files (the recording too,
+                                                               unless keep_recording)
+    POST api/course-from-recording/v1/jobs/<id>/reuse-recording/ -> a new job with the recording a started-over job
+                                                                    kept, queued straight away
 
 Course authors only. The studio tool service's own endpoint is in views_service.py.
 """
@@ -14,6 +19,9 @@ Course authors only. The studio tool service's own endpoint is in views_service.
 import logging
 
 import redis
+from botocore.exceptions import BotoCoreError, ClientError
+from django.db import transaction
+from django.utils import timezone
 from django.utils.translation import gettext as _
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication
 from rest_framework import status
@@ -28,9 +36,18 @@ from xmodule.modulestore.django import modulestore
 
 from . import services
 from .models import RecordingJob
-from .serializers import JobCreateSerializer, SpeakerLabelsSerializer
+from .serializers import (
+    JobCreateSerializer,
+    ReuseRecordingSerializer,
+    SpeakerLabelsSerializer,
+    StartOverSerializer,
+    TranscriptEditSerializer,
+)
 
 log = logging.getLogger(__name__)
+
+# More corrections than a 4-hour recording has lines; only there to keep the row a sensible size.
+MAX_TRANSCRIPT_EDITS = 5000
 
 
 def not_configured_response():
@@ -58,6 +75,9 @@ def serialize_job(job):
         "downloads": services.download_urls(job),
         "speaker_groups": services.speaker_groups_with_urls(job),
         "speaker_labels": job.speaker_labels,
+        "transcribed_minutes": job.transcribed_minutes,
+        "recording_kept": job.recording_kept,
+        "transcript_edits": job.transcript_edits,
         "created": job.created.isoformat(),
         "modified": job.modified.isoformat(),
     }
@@ -67,6 +87,16 @@ class AuthorAPIView(APIView):
     authentication_classes = (JwtAuthentication, SessionAuthentication)
     permission_classes = (IsAuthenticated,)
 
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        # Once the user is known: nothing works without the service's settings.
+        services.tool_settings()
+
+    def handle_exception(self, exc):
+        if isinstance(exc, services.NotConfigured):
+            return not_configured_response()
+        return super().handle_exception(exc)
+
     def get_job(self, request, job_id):
         """Return ``(job, None)``, or ``(None, Response)`` if it doesn't exist or isn't the user's course."""
         job = RecordingJob.objects.filter(id=job_id).first()
@@ -74,28 +104,35 @@ class AuthorAPIView(APIView):
             return None, Response({"error": _("Job not found.")}, status=status.HTTP_404_NOT_FOUND)
         if not has_course_author_access(request.user, job.course_id):
             return None, forbidden_response()
-        try:
-            services.tool_settings()
-        except services.NotConfigured:
-            return None, not_configured_response()
         return job, None
 
-    def queue(self, job, from_status):
-        """Move the job to "queued" and onto the service's queue; undo the move if Redis is down."""
-        job.status = RecordingJob.Status.QUEUED
-        job.progress = 0
-        job.error = ""
-        job.save(update_fields=["status", "progress", "error", "modified"])
+    def queue(self, job, from_status, fail_if_redis_is_down=False):
+        """
+        Move the job from ``from_status`` to "queued" and onto the service's queue. The move is one
+        conditional update, so two requests at once (a double click) queue the job only once.
+
+        If Redis is down the move is undone, or with ``fail_if_redis_is_down`` the job is marked failed
+        instead, so the author gets the Retry button (for a job that never was "uploading" for them).
+        """
+        moved = RecordingJob.objects.filter(id=job.id, status=from_status).update(
+            status=RecordingJob.Status.QUEUED, progress=0, error="", modified=timezone.now()
+        )
+        if not moved:
+            return Response({"error": _("This job has already been started.")}, status=status.HTTP_409_CONFLICT)
         try:
             services.enqueue(job)
         except redis.RedisError:
             log.exception("Could not queue recording job %s", job.id)
-            job.status = from_status
-            job.save(update_fields=["status", "modified"])
-            return Response(
-                {"error": _("The recording could not be queued. Try again in a few minutes.")},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            message = _("The recording could not be queued. Try again in a few minutes.")
+            undo = {"status": RecordingJob.Status.FAILED, "error": message} if fail_if_redis_is_down else {
+                "status": from_status
+            }
+            RecordingJob.objects.filter(id=job.id, status=RecordingJob.Status.QUEUED).update(
+                **undo, modified=timezone.now()
             )
+            if not fail_if_redis_is_down:
+                return Response({"error": message}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        job.refresh_from_db()
         return Response({"job": serialize_job(job)})
 
 
@@ -108,10 +145,6 @@ class JobsView(AuthorAPIView):
             return error
         if not has_course_author_access(request.user, course_key):
             return forbidden_response()
-        try:
-            services.tool_settings()
-        except services.NotConfigured:
-            return not_configured_response()
         job = RecordingJob.objects.filter(course_id=course_key).first()
         return Response({"job": serialize_job(job) if job else None})
 
@@ -127,10 +160,6 @@ class JobsView(AuthorAPIView):
             return forbidden_response()
         if modulestore().get_course(course_key) is None:
             return Response({"error": _("Course not found.")}, status=status.HTTP_404_NOT_FOUND)
-        try:
-            services.tool_settings()
-        except services.NotConfigured:
-            return not_configured_response()
 
         job = RecordingJob.objects.create(
             course_id=course_key,
@@ -207,3 +236,134 @@ class JobRetryView(AuthorAPIView):
         if job.status != RecordingJob.Status.FAILED:
             return Response({"error": _("Only a failed job can be retried.")}, status=status.HTTP_409_CONFLICT)
         return self.queue(job, from_status=RecordingJob.Status.FAILED)
+
+
+class JobTranscriptEditView(AuthorAPIView):
+    """The author's correction of one transcript line, saved as they go; the transcript file stays as it was."""
+
+    def post(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        serializer = TranscriptEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        line, text = str(serializer.validated_data["line"]), serializer.validated_data["text"]
+        # Locked while it is read and written back, so two saves at once (two tabs) both keep their line.
+        with transaction.atomic():
+            job = RecordingJob.objects.select_for_update().get(id=job.id)
+            if job.status != RecordingJob.Status.TRANSCRIPT_READY:
+                return Response({"error": _("The transcript is not ready yet.")}, status=status.HTTP_409_CONFLICT)
+            edits = dict(job.transcript_edits)
+            if text is None:
+                edits.pop(line, None)
+            else:
+                edits[line] = text
+            if len(edits) > MAX_TRANSCRIPT_EDITS:
+                return Response(
+                    {"error": _("This transcript has too many corrections to save more.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            job.transcript_edits = edits
+            job.save(update_fields=["transcript_edits", "modified"])
+        return Response({"transcript_edits": job.transcript_edits})
+
+
+class JobStartOverView(AuthorAPIView):
+    """
+    Stop the job and delete its files, so the author can start again: with the same recording
+    (kept in S3, to reuse without uploading it again) or with a different one (then it is deleted too).
+    """
+
+    def post(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        serializer = StartOverSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        keep = serializer.validated_data["keep_recording"]
+
+        # Locked, so a progress report the service is saving at the same moment can't undo the stop
+        # (views_service locks the row too).
+        with transaction.atomic():
+            job = RecordingJob.objects.select_for_update().get(id=job.id)
+            if job.status == RecordingJob.Status.UPLOADING:
+                # The browser may still be sending the file, which would land after the files were deleted.
+                return Response(
+                    {"error": _("The recording is still uploading. Start over once it has finished.")},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            # A deleted recording can't come back.
+            if keep and job.status == RecordingJob.Status.CANCELLED and not job.recording_kept:
+                return Response(
+                    {"error": _("The recording is no longer there to keep. Upload it again.")},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            # Stop the job first: the service's next progress report is refused, and it stops and writes nothing
+            # more.
+            job.status = RecordingJob.Status.CANCELLED
+            job.progress = 0
+            job.error = ""
+            job.results = {}
+            job.speaker_groups = []
+            job.speaker_labels = {}
+            job.transcript_edits = {}
+            job.recording_kept = keep
+            job.save()
+        try:
+            deleted = services.delete_files(job, keep_recording=keep)
+        except (BotoCoreError, ClientError):
+            log.exception("Could not delete the files of recording job %s", job.id)
+            return Response(
+                {
+                    "error": _(
+                        "The job was stopped, but its files could not all be deleted. Try again in a few minutes."
+                    )
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        log.info("Recording job %s started over: %s files deleted, recording kept: %s", job.id, deleted, keep)
+        return Response({"job": serialize_job(job)})
+
+
+class JobReuseRecordingView(AuthorAPIView):
+    """A new job for the recording a started-over job kept, with the author's details; queued straight away."""
+
+    def post(self, request, job_id):
+        old, error = self.get_job(request, job_id)
+        if error:
+            return error
+        serializer = ReuseRecordingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Claim the recording (locked), so two requests at once can't both start a job with it.
+        with transaction.atomic():
+            old = RecordingJob.objects.select_for_update().get(id=old.id)
+            if old.status != RecordingJob.Status.CANCELLED or not old.recording_kept:
+                return Response(
+                    {"error": _("This recording is no longer kept. Upload it again.")},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            old.recording_kept = False
+            old.save(update_fields=["recording_kept", "modified"])
+            job = RecordingJob.objects.create(
+                course_id=old.course_id,
+                user=request.user,
+                metadata=serializer.validated_data["details"],
+                original_filename=old.original_filename,
+                content_type=old.content_type,
+                file_size=old.file_size,
+            )
+        try:
+            services.move_recording(old, job)
+        except (BotoCoreError, ClientError):
+            log.exception("Could not move the recording of job %s to job %s", old.id, job.id)
+            job.delete()
+            old.recording_kept = True
+            old.save(update_fields=["recording_kept", "modified"])
+            return Response(
+                {"error": _("The recording could not be reused. Try again in a few minutes.")},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        # The recording is in the new job now, so if Redis is down that job fails (with Retry) rather than
+        # going back to waiting for an upload that already happened.
+        return self.queue(job, from_status=RecordingJob.Status.UPLOADING, fail_if_redis_is_down=True)

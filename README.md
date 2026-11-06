@@ -192,8 +192,14 @@ inside Open edX; this app only keeps track of the jobs.
 - **Uploads go straight to S3.** The API returns a signed upload link for one file,
   with its content type and size in the signature, so the recording never passes
   through Studio and S3 refuses any other file.
-- **Files** live in the private Open edX bucket under
-  `studio-tools/course-from-recording/<job id>/`.
+- **Files** live in the private Open edX bucket, one folder per course and one per
+  recording, chosen when the job is created and saved on it (`folder`):
+  `studio-tools/course-from-recording/<course>/<date>_<file name>_<short id>/`, e.g.
+  `studio-tools/course-from-recording/Sherab-tspc12-2026/2026-11-03_audio-tibetan_a101e248/`.
+  Inside it, one numbered folder per step: `0-original/` (the upload, never changed),
+  `1-voices/` (only with more than one speaker), `2-clean/`, `3-transcript/`, plus a
+  `job.json` summary written by the service. Names are lowercase ASCII with dashes; a
+  file name with nothing left (e.g. all Tibetan) becomes `recording`.
 - **Queue:** starting a job pushes `course_from_recording:<job id>` onto the
   service's Redis list. The service trusts only the id and reads the rest from
   this app, so a queue entry this app didn't create leads nowhere.
@@ -209,10 +215,18 @@ inside Open edX; this app only keeps track of the jobs.
   than one speaker `speaker_groups` (the voices the service found, with sample clips)
   and `speaker_labels` (the author's tag for each: teacher, translator, chanting, other).
 
-  Statuses: `uploading` → `queued` → `cleaning` → `finding_speakers` →
-  `needs_speaker_labels` → `queued` → `transcribing` → `transcript_ready`, or `failed`.
-  One-speaker recordings skip `finding_speakers` and `needs_speaker_labels`. While a
-  job waits for the author's tags it is off the queue; tagging puts it back.
+  Statuses with more than one speaker: `uploading` → `queued` → `finding_speakers` →
+  `needs_speaker_labels` → `queued` → `cleaning` → `transcribing` → `transcript_ready`.
+  With one speaker, speaker detection is skipped: `uploading` → `queued` → `cleaning` →
+  `transcribing` → `transcript_ready`. Any step can end in `failed`. While a job waits
+  for the author's tags it is off the queue; tagging puts it back. The API doesn't
+  enforce this order; the service follows it.
+- **Starting over.** From any step the author can start over: the job becomes `cancelled`,
+  its files are deleted from S3, and the recording too unless the author keeps it
+  (`recording_kept`). A kept recording is moved into a new job's folder by
+  `reuse-recording/`, so it isn't uploaded again. The service learns of it from its next
+  progress report (refused with `409` and `"status": "cancelled"`), stops, and deletes what it
+  wrote since. The job row stays, with its `transcribed_minutes`, for cost tracking.
 
 ### Components
 
@@ -234,6 +248,8 @@ inside Open edX; this app only keeps track of the jobs.
 | Author | POST | `/api/course-from-recording/v1/jobs/<id>/start/` | Check the upload is in S3 with the declared size, then queue the job. |
 | Author | POST | `/api/course-from-recording/v1/jobs/<id>/speakers/` | Tag the voices: `{labels: {group: "teacher" \| "translator" \| "chanting" \| "other"}}`. Every group needs a tag and at least one must be the teacher (one voice is sometimes split into two groups). Queues the job again. |
 | Author | POST | `/api/course-from-recording/v1/jobs/<id>/retry/` | Queue a failed job again; the service continues from the step that failed. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/start-over/` | `{"keep_recording": true}`: stop the job (`cancelled`) and delete its files from S3, the recording too unless kept. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/reuse-recording/` | `{"consent": true, "details": {...}}`: a new job with the recording a started-over job kept, queued straight away. |
 | Service | GET | `/api/course-from-recording/v1/service/jobs/<id>/` | Job details, its S3 folder, the recording's key, and the speaker groups and the author's tags. |
 | Service | PATCH | `/api/course-from-recording/v1/service/jobs/<id>/` | Progress report: any of `status`, `progress`, `error`, `results` (merged), `duration_seconds`, `transcribed_minutes`, `speaker_groups`. `needs_speaker_labels` is accepted only for multi-speaker recordings and with the groups. |
 
