@@ -6,10 +6,13 @@ and ``redis_client``.
 """
 
 import functools
+import json
 import logging
 import os
+import posixpath
 import re
 import unicodedata
+from urllib.parse import quote
 
 import boto3
 import redis
@@ -26,6 +29,11 @@ UPLOAD_URL_SECONDS = 6 * 3600
 DOWNLOAD_URL_SECONDS = 3600
 
 REQUIRED_SETTINGS = ("REDIS_URL", "QUEUE", "BUCKET", "TOKEN")
+
+# The finished course's lesson audio, in the public assets bucket (PUBLIC_BUCKET): the course plays it
+# from there, so it never expires. A file's name never changes, so browsers may keep it for good.
+PUBLIC_AUDIO_FOLDER = "course-audio"
+PUBLIC_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
 class NotConfigured(Exception):
@@ -117,15 +125,63 @@ def upload_url(job):
     )
 
 
-def uploaded_size(job):
-    """Size in bytes of the uploaded recording, or None if it isn't in S3 (yet)."""
+def _head(client, bucket, key):
+    """The file's details, or None if it isn't in S3."""
     try:
-        head = s3_client().head_object(Bucket=tool_settings()["BUCKET"], Key=original_key(job))
+        return client.head_object(Bucket=bucket, Key=key)
     except ClientError as error:
         if error.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
             return None
         raise
-    return head["ContentLength"]
+
+
+def uploaded_size(job):
+    """Size in bytes of the uploaded recording, or None if it isn't in S3 (yet)."""
+    head = _head(s3_client(), tool_settings()["BUCKET"], original_key(job))
+    return head["ContentLength"] if head else None
+
+
+def read_json(job, path):
+    """A JSON file the service saved in the job's folder, e.g. '3-transcript/transcript.json'."""
+    obj = s3_client().get_object(Bucket=tool_settings()["BUCKET"], Key=f"{job_folder(job)}/{path}")
+    return json.loads(obj["Body"].read())
+
+
+def public_settings():
+    """The public assets bucket and the address it is served from, e.g. 'https://<bucket>.s3.<region>…'."""
+    config = tool_settings()
+    bucket, url = config.get("PUBLIC_BUCKET"), (config.get("PUBLIC_URL") or "").rstrip("/")
+    if not bucket or url in ("", "https:", "http:"):
+        raise NotConfigured("STUDIO_TOOL_SERVICE is missing PUBLIC_BUCKET or PUBLIC_URL")
+    return bucket, url
+
+
+def public_audio_key(job, path):
+    """
+    Where a lesson clip goes in the public bucket, named like the job's folder:
+    'course-audio/<course>/<date>_<file name>_<short id>/<clip>'.
+    """
+    course, name = job_folder(job).rstrip("/").split("/")[-2:]
+    return f"{PUBLIC_AUDIO_FOLDER}/{course}/{name}/{posixpath.basename(path)}"
+
+
+def copy_to_public(job, path):
+    """
+    Copy one of the service's lesson clips (a path in the job's folder) to the public bucket, inside S3,
+    and return its permanent address. A clip already there is left as it is, so this can run again.
+    """
+    bucket, url = public_settings()
+    client, key = s3_client(), public_audio_key(job, path)
+    if _head(client, bucket, key) is None:
+        client.copy_object(
+            Bucket=bucket,
+            Key=key,
+            CopySource={"Bucket": tool_settings()["BUCKET"], "Key": f"{job_folder(job)}/{path}"},
+            ContentType="audio/mpeg",
+            CacheControl=PUBLIC_CACHE_CONTROL,
+            MetadataDirective="REPLACE",
+        )
+    return f"{url}/{quote(key)}"
 
 
 def _file_url(client, job, path):

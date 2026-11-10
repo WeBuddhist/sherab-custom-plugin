@@ -111,6 +111,120 @@ class SpeakerGroupSerializer(serializers.Serializer):
     )
 
 
+class MultipleChoiceSerializer(serializers.Serializer):
+    """One practice question: options, the index of the right one, and why it is right."""
+
+    question = serializers.CharField(max_length=1000)
+    options = serializers.ListField(child=serializers.CharField(max_length=500), min_length=2, max_length=6)
+    answer = serializers.IntegerField(min_value=0)
+    explanation = serializers.CharField(max_length=2000, allow_blank=True, required=False, default="")
+
+    def validate(self, attrs):
+        options = [option.strip() for option in attrs["options"]]
+        # The course writer marks the right option by its text, so two options can't be the same.
+        if len(set(options)) != len(options):
+            raise serializers.ValidationError(_("Each option of a question must be different."))
+        if attrs["answer"] >= len(options):
+            raise serializers.ValidationError(_("The right answer must be one of the options."))
+        return {**attrs, "options": options}
+
+
+class LessonSerializer(serializers.Serializer):
+    """
+    One lesson (a subsection in the course). ``first_line``/``last_line`` are line numbers in the
+    service's 3-transcript/transcript.json (the same numbers as transcript_edits); start/end are seconds.
+    """
+
+    id = serializers.CharField(max_length=32)
+    title = serializers.CharField(max_length=255)
+    include = serializers.BooleanField(default=True)
+    first_line = serializers.IntegerField(min_value=0)
+    last_line = serializers.IntegerField(min_value=0)
+    start = serializers.FloatField(min_value=0)
+    end = serializers.FloatField(min_value=0)
+    minutes = serializers.FloatField(min_value=0)
+    summary = serializers.CharField(max_length=5000, allow_blank=True)
+    key_points = serializers.ListField(child=serializers.CharField(max_length=1000), max_length=10)
+    mcq = MultipleChoiceSerializer(many=True, max_length=10)
+    reflection = serializers.ListField(child=serializers.CharField(max_length=1000), max_length=10)
+
+    def validate(self, attrs):
+        if attrs["first_line"] > attrs["last_line"] or attrs["start"] >= attrs["end"]:
+            raise serializers.ValidationError(_("A lesson must end after it starts."))
+        return attrs
+
+
+class SectionSerializer(serializers.Serializer):
+    id = serializers.CharField(max_length=32)
+    title = serializers.CharField(max_length=255)
+    lessons = LessonSerializer(many=True, min_length=1, max_length=50)
+
+
+class CourseDraftSerializer(serializers.Serializer):
+    """The draft course: sections of lessons, in the order of the teaching."""
+
+    version = serializers.IntegerField(min_value=1, max_value=1)
+    course_title = serializers.CharField(max_length=255, allow_blank=True)
+    sections = SectionSerializer(many=True, min_length=1, max_length=30)
+
+    def validate(self, attrs):
+        ids = [section["id"] for section in attrs["sections"]]
+        lessons = [lesson for section in attrs["sections"] for lesson in section["lessons"]]
+        ids += [lesson["id"] for lesson in lessons]
+        if len(set(ids)) != len(ids):
+            raise serializers.ValidationError(_("Each section and lesson needs its own id."))
+        # Lessons follow the teaching: each starts after the one before it ends.
+        for before, after in zip(lessons, lessons[1:]):
+            if after["first_line"] <= before["last_line"]:
+                raise serializers.ValidationError(_("The lessons must follow the order of the teaching."))
+        return attrs
+
+
+def draft_structure(draft):
+    """What the author may not change: the sections and lessons, their ids and where each lesson is."""
+    return [
+        (
+            section["id"],
+            [
+                (lesson["id"], lesson["first_line"], lesson["last_line"], lesson["start"], lesson["end"])
+                for lesson in section["lessons"]
+            ],
+        )
+        for section in draft.get("sections", [])
+    ]
+
+
+def included_lessons(draft):
+    return [lesson for section in draft.get("sections", []) for lesson in section["lessons"] if lesson["include"]]
+
+
+class BuildCourseSerializer(serializers.Serializer):
+    approved = serializers.BooleanField()
+
+    def validate_approved(self, value):
+        if not value:
+            raise serializers.ValidationError(_("Confirm the teacher or their office has reviewed the outline."))
+        return value
+
+
+class LessonAudioSerializer(serializers.Serializer):
+    """The clips the service cut for one lesson: track -> path inside the job folder."""
+
+    tracks = serializers.DictField(child=serializers.CharField(max_length=512, validators=[validate_result_path]))
+
+    def validate_tracks(self, value):
+        unknown = set(value) - {"bo", "translator"}
+        if unknown:
+            raise serializers.ValidationError(_("Unknown audio track: {tracks}.").format(tracks=", ".join(unknown)))
+        return value
+
+
+class CourseAudioSerializer(serializers.Serializer):
+    """The service's call to write the course: each included lesson's clips, by lesson id."""
+
+    lessons = serializers.DictField(child=LessonAudioSerializer())
+
+
 class ServiceUpdateSerializer(serializers.Serializer):
     """A progress report from the studio tool service. Every field is optional."""
 
@@ -123,6 +237,12 @@ class ServiceUpdateSerializer(serializers.Serializer):
     duration_seconds = serializers.FloatField(min_value=0, required=False)
     transcribed_minutes = serializers.FloatField(min_value=0, required=False)
     speaker_groups = SpeakerGroupSerializer(many=True, required=False, max_length=10)
+    course_draft = CourseDraftSerializer(required=False)
+
+    def validate(self, attrs):
+        if "course_draft" in attrs and attrs.get("status") != "course_draft_ready":
+            raise serializers.ValidationError(_("A course draft comes with the status course_draft_ready."))
+        return attrs
 
     def validate_speaker_groups(self, value):
         groups = [group["group"] for group in value]

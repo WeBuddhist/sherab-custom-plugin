@@ -14,6 +14,7 @@ from rest_framework.test import APIClient
 from common.djangoapps.student.tests.factories import UserFactory
 from course_from_recording import services, views
 from course_from_recording.models import RecordingJob
+from course_from_recording.tests import views_outside_transactions
 from xmodule.modulestore.tests.django_utils import ModuleStoreTestCase
 from xmodule.modulestore.tests.factories import CourseFactory
 
@@ -36,6 +37,7 @@ class StudioJobsAPITest(ModuleStoreTestCase):
         self.course = CourseFactory.create()
         self.client = APIClient()
         self.client.force_authenticate(self.user)  # ModuleStoreTestCase's user is global staff
+        views_outside_transactions(self)
 
         self.s3 = mock.MagicMock()
         self.s3.generate_presigned_url.return_value = "https://s3.example/signed"

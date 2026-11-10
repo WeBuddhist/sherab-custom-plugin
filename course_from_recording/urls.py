@@ -8,6 +8,8 @@ absolute paths are e.g. ``/api/course-from-recording/v1/jobs/`` on the Studio ho
 from django.urls import path
 
 from .views import (
+    JobBuildCourseView,
+    JobCourseDraftView,
     JobDetailView,
     JobRetryView,
     JobReuseRecordingView,
@@ -15,9 +17,10 @@ from .views import (
     JobStartOverView,
     JobStartView,
     JobsView,
+    JobSuggestCourseView,
     JobTranscriptEditView,
 )
-from .views_service import ServiceJobView
+from .views_service import ServiceCourseView, ServiceJobView
 
 app_name = "course_from_recording"
 
@@ -40,5 +43,19 @@ urlpatterns = [
         JobReuseRecordingView.as_view(),
         name="job-reuse-recording",
     ),
+    path(
+        "api/course-from-recording/v1/jobs/<uuid:job_id>/suggest/", JobSuggestCourseView.as_view(), name="job-suggest"
+    ),
+    path(
+        "api/course-from-recording/v1/jobs/<uuid:job_id>/course-draft/",
+        JobCourseDraftView.as_view(),
+        name="job-course-draft",
+    ),
+    path("api/course-from-recording/v1/jobs/<uuid:job_id>/build/", JobBuildCourseView.as_view(), name="job-build"),
     path("api/course-from-recording/v1/service/jobs/<uuid:job_id>/", ServiceJobView.as_view(), name="service-job"),
+    path(
+        "api/course-from-recording/v1/service/jobs/<uuid:job_id>/course/",
+        ServiceCourseView.as_view(),
+        name="service-job-course",
+    ),
 ]

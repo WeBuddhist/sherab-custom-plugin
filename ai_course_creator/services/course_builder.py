@@ -59,21 +59,24 @@ def _normalise_correct(correct):
     return {str(correct).strip()}
 
 
-def _solution_xml(explanation):
-    """Build the optional <solution> explanation block shared by all problems."""
+def _solution_xml(explanation, label=None):
+    """
+    Build the optional <solution> explanation block shared by all problems. ``label`` is its heading
+    ("Explanation" unless given, e.g. in the course's own language).
+    """
     if not explanation:
         return ""
     return (
         '  <solution>\n'
         '    <div class="detailed-solution">\n'
-        "      <p>Explanation</p>\n"
+        f"      <p>{escape(label or 'Explanation')}</p>\n"
         f"      <p>{escape(explanation)}</p>\n"
         "    </div>\n"
         "  </solution>\n"
     )
 
 
-def _multiple_choice_olx(question, choices, correct, explanation=""):
+def _multiple_choice_olx(question, choices, correct, explanation="", explanation_label=None):
     """Single-select MCQ (also used for True/False)."""
     correct_set = _normalise_correct(correct)
     choice_xml = []
@@ -88,7 +91,7 @@ def _multiple_choice_olx(question, choices, correct, explanation=""):
         + "\n".join(choice_xml)
         + "\n    </choicegroup>\n"
         "  </multiplechoiceresponse>\n"
-        + _solution_xml(explanation)
+        + _solution_xml(explanation, explanation_label)
         + "</problem>"
     )
 
@@ -175,6 +178,8 @@ def build_problem_olx(component):
     choices = component.get("choices") or []
     correct = component.get("correct")
     explanation = component.get("explanation") or ""
+    # The explanation's heading, e.g. in the course's own language ("Explanation" if not given).
+    label = component.get("explanationLabel")
 
     if problem_type in ("truefalse", "true_false", "true/false"):
         # Normalise the correct answer to one of the two labels.
@@ -190,16 +195,30 @@ def build_problem_olx(component):
     if problem_type in ("shortanswer", "short_answer", "stringresponse", "text", "textinput"):
         return _short_answer_olx(question, correct, explanation)
     if problem_type in ("multiplechoice", "multiple_choice", "mcq", "singleselect", "single_select"):
-        return _multiple_choice_olx(question, choices, correct, explanation)
+        return _multiple_choice_olx(question, choices, correct, explanation, label)
     # Anything unknown: multiple choice if we have options, else short answer.
     if choices:
-        return _multiple_choice_olx(question, choices, correct, explanation)
+        return _multiple_choice_olx(question, choices, correct, explanation, label)
     return _short_answer_olx(question, correct, explanation)
 
 
 # --------------------------------------------------------------------------- #
 # Component creation
 # --------------------------------------------------------------------------- #
+def _max_attempts(component):
+    """
+    How many tries a problem allows: 1 unless the component says otherwise. ``"maxAttempts": None`` sets no
+    limit of the problem's own, so the course's "Maximum Attempts" advanced setting applies (unlimited
+    while that is empty). Anything that isn't a positive whole number (e.g. from a model's JSON) counts as 1.
+    """
+    value = component.get("maxAttempts", 1)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
 def _create_component(store, user, parent_locator, component):
     """Create a single leaf component under a unit (vertical)."""
     from cms.djangoapps.contentstore.xblock_storage_handlers.create_xblock import create_xblock
@@ -252,7 +271,9 @@ def _create_component(store, user, parent_locator, component):
     if comp_type == "problem":
         block = create_xblock(parent_locator, user, "problem", title)
         block.data = build_problem_olx(component)
-        block.max_attempts = 1
+        max_attempts = _max_attempts(component)
+        if max_attempts is not None:  # None: left unset, so the course's setting applies
+            block.max_attempts = max_attempts
         store.update_item(block, user.id)
         return "problem"
 
@@ -264,7 +285,7 @@ def _create_component(store, user, parent_locator, component):
     return "html"
 
 
-def apply_course_json(course_key, user, course_json):
+def apply_course_json(course_key, user, course_json, strict=False):
     """
     Build the full course structure described by ``course_json``.
 
@@ -272,6 +293,8 @@ def apply_course_json(course_key, user, course_json):
         course_key: a CourseKey (or string) for the target course.
         user: the authoring user.
         course_json: the parsed COURSE_JSON dict.
+        strict: if True, a component that can't be created fails the whole build (and what was made is
+            removed again) instead of being skipped.
 
     Returns:
         dict summary: counts of created blocks and the created section locators.
@@ -335,6 +358,8 @@ def apply_course_json(course_key, user, course_json):
                                 _create_component(store, user, vertical_locator, component)
                                 counts["components"] += 1
                             except Exception:  # pylint: disable=broad-except
+                                if strict:
+                                    raise
                                 log.exception(
                                     "ai_course_creator: failed to create component %s", component
                                 )

@@ -12,8 +12,12 @@ Studio API for the "From a teaching recording" tool, used by the studio-extensio
                                                                unless keep_recording)
     POST api/course-from-recording/v1/jobs/<id>/reuse-recording/ -> a new job with the recording a started-over job
                                                                     kept, queued straight away
+    POST api/course-from-recording/v1/jobs/<id>/suggest/      -> queue a transcribed job to suggest a course
+    PUT  api/course-from-recording/v1/jobs/<id>/course-draft/ -> save the author's changes to the draft course
+    POST api/course-from-recording/v1/jobs/<id>/build/        -> the teacher has reviewed it: cut the audio and
+                                                                 write the course
 
-Course authors only. The studio tool service's own endpoint is in views_service.py.
+Course authors only. The studio tool service's own endpoints are in views_service.py.
 """
 
 import logging
@@ -23,6 +27,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from django.utils.translation import gettext as _
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication
 from rest_framework import status
@@ -38,11 +43,15 @@ from xmodule.modulestore.django import modulestore
 from . import services
 from .models import RecordingJob
 from .serializers import (
+    BuildCourseSerializer,
+    CourseDraftSerializer,
     JobCreateSerializer,
     ReuseRecordingSerializer,
     SpeakerLabelsSerializer,
     StartOverSerializer,
     TranscriptEditSerializer,
+    draft_structure,
+    included_lessons,
 )
 
 log = logging.getLogger(__name__)
@@ -79,11 +88,18 @@ def serialize_job(job):
         "transcribed_minutes": job.transcribed_minutes,
         "recording_kept": job.recording_kept,
         "transcript_edits": job.transcript_edits,
+        "course_draft": job.course_draft,
+        "course_approved": job.course_approved_at is not None,
+        "course_sections": job.course_sections,
         "created": job.created.isoformat(),
         "modified": job.modified.isoformat(),
     }
 
 
+# Open edX runs each request in one database transaction (ATOMIC_REQUESTS). Not these: a job must be saved
+# before it goes onto the queue, or the service could read it before the change is visible and run the wrong
+# step. Views that read and write a job together lock it in their own transaction.atomic() block.
+@method_decorator(transaction.non_atomic_requests, name="dispatch")
 class AuthorAPIView(APIView):
     authentication_classes = (JwtAuthentication, SessionAuthentication)
     permission_classes = (IsAuthenticated,)
@@ -107,16 +123,20 @@ class AuthorAPIView(APIView):
             return None, forbidden_response()
         return job, None
 
-    def queue(self, job, from_status, fail_if_redis_is_down=False):
+    def queue(self, job, from_status, fail_if_redis_is_down=False, also_set=None):
         """
         Move the job from ``from_status`` to "queued" and onto the service's queue. The move is one
         conditional update, so two requests at once (a double click) queue the job only once.
+        ``also_set``: other fields that change with the move (e.g. the author's approval).
 
-        If Redis is down the move is undone, or with ``fail_if_redis_is_down`` the job is marked failed
-        instead, so the author gets the Retry button (for a job that never was "uploading" for them).
+        If Redis is down the move is undone (``also_set`` too), or with ``fail_if_redis_is_down`` the job is
+        marked failed instead, so the author gets the Retry button (for a job that never was "uploading" for
+        them).
         """
+        also_set = also_set or {}
+        before = {field: getattr(job, field) for field in also_set}
         moved = RecordingJob.objects.filter(id=job.id, status=from_status).update(
-            status=RecordingJob.Status.QUEUED, progress=0, error="", modified=timezone.now()
+            status=RecordingJob.Status.QUEUED, progress=0, error="", modified=timezone.now(), **also_set
         )
         if not moved:
             return Response({"error": _("This job has already been started.")}, status=status.HTTP_409_CONFLICT)
@@ -126,7 +146,7 @@ class AuthorAPIView(APIView):
             log.exception("Could not queue recording job %s", job.id)
             message = _("The recording could not be queued. Try again in a few minutes.")
             undo = {"status": RecordingJob.Status.FAILED, "error": message} if fail_if_redis_is_down else {
-                "status": from_status
+                "status": from_status, **before
             }
             RecordingJob.objects.filter(id=job.id, status=RecordingJob.Status.QUEUED).update(
                 **undo, modified=timezone.now()
@@ -311,6 +331,9 @@ class JobStartOverView(AuthorAPIView):
             job.speaker_groups = []
             job.speaker_labels = {}
             job.transcript_edits = {}
+            # A course already written stays in the course outline, with its audio; only the draft goes.
+            job.course_draft = {}
+            job.course_approved_at = None
             job.recording_kept = keep
             job.save()
         try:
@@ -371,3 +394,65 @@ class JobReuseRecordingView(AuthorAPIView):
         # The recording is in the new job now, so if Redis is down that job fails (with Retry) rather than
         # going back to waiting for an upload that already happened.
         return self.queue(job, from_status=RecordingJob.Status.UPLOADING, fail_if_redis_is_down=True)
+
+
+class JobSuggestCourseView(AuthorAPIView):
+    """Once the transcript is checked: the service suggests a course from it (outline, lessons, questions)."""
+
+    def post(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        if job.status != RecordingJob.Status.TRANSCRIPT_READY:
+            return Response({"error": _("The transcript is not ready yet.")}, status=status.HTTP_409_CONFLICT)
+        return self.queue(job, from_status=RecordingJob.Status.TRANSCRIPT_READY)
+
+
+class JobCourseDraftView(AuthorAPIView):
+    """
+    The author's changes to the suggested course, saved as they go: titles, lessons switched off, summaries,
+    key points and questions. Where each lesson starts and ends can't change.
+    """
+
+    def put(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        serializer = CourseDraftSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        draft = serializer.validated_data
+        with transaction.atomic():
+            job = RecordingJob.objects.select_for_update().get(id=job.id)
+            if job.status != RecordingJob.Status.COURSE_DRAFT_READY:
+                return Response(
+                    {"error": _("The course can only be changed here before it is created.")},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if draft_structure(draft) != draft_structure(job.course_draft):
+                return Response(
+                    {"error": _("Lessons can't be added, removed or moved here; only switched off.")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            job.course_draft = draft
+            job.save(update_fields=["course_draft", "modified"])
+        return Response({"course_draft": job.course_draft})
+
+
+class JobBuildCourseView(AuthorAPIView):
+    """The author confirms the teacher has reviewed the outline: cut the lesson audio and write the course."""
+
+    def post(self, request, job_id):
+        job, error = self.get_job(request, job_id)
+        if error:
+            return error
+        serializer = BuildCourseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if job.status != RecordingJob.Status.COURSE_DRAFT_READY:
+            return Response({"error": _("This course has already been created.")}, status=status.HTTP_409_CONFLICT)
+        if not included_lessons(job.course_draft):
+            return Response({"error": _("Keep at least one lesson.")}, status=status.HTTP_400_BAD_REQUEST)
+        # The approval is saved with the move to "queued" and undone with it if the job can't be queued, so a
+        # draft the author can still change is never marked as reviewed.
+        return self.queue(
+            job, from_status=RecordingJob.Status.COURSE_DRAFT_READY, also_set={"course_approved_at": timezone.now()}
+        )

@@ -37,6 +37,12 @@ class RecordingJob(TimeStampedModel):
         NEEDS_SPEAKER_LABELS = "needs_speaker_labels", _("Waiting for you to tag the voices")
         TRANSCRIBING = "transcribing", _("Transcribing")
         TRANSCRIPT_READY = "transcript_ready", _("Transcript ready")
+        # Phase 2: the transcript becomes a draft course in Studio.
+        SUGGESTING = "suggesting", _("Suggesting a course")
+        COURSE_DRAFT_READY = "course_draft_ready", _("Waiting for you to shape the course")
+        CUTTING_AUDIO = "cutting_audio", _("Cutting the lesson audio")
+        WRITING_COURSE = "writing_course", _("Adding the course to Studio")
+        COURSE_READY = "course_ready", _("Draft course ready")
         FAILED = "failed", _("Failed")
         # The author started over: the job stopped and its files were deleted (the recording too,
         # unless recording_kept). It stays as a record, e.g. of the minutes already transcribed.
@@ -85,6 +91,17 @@ class RecordingJob(TimeStampedModel):
     transcript_edits = models.JSONField(
         default=dict, blank=True, help_text=_("Set by the author: line number -> corrected text.")
     )
+    # Phase 2. The service suggests the draft (its own copy stays in S3, 4-course/suggestion.json); the
+    # author shapes this copy, ticks that the teacher has reviewed it, and the course is written from it.
+    course_draft = models.JSONField(
+        default=dict, blank=True, help_text=_("The course outline and lessons, as the author last saved them.")
+    )
+    course_approved_at = models.DateTimeField(
+        null=True, blank=True, help_text=_("When the author confirmed the teacher has reviewed the outline.")
+    )
+    course_sections = models.JSONField(
+        default=list, blank=True, help_text=_("The sections written into the course (usage keys).")
+    )
 
     class Meta:
         ordering = ["-created"]
@@ -112,14 +129,21 @@ SERVICE_STATUSES = (
     RecordingJob.Status.NEEDS_SPEAKER_LABELS,
     RecordingJob.Status.TRANSCRIBING,
     RecordingJob.Status.TRANSCRIPT_READY,
+    RecordingJob.Status.SUGGESTING,
+    RecordingJob.Status.COURSE_DRAFT_READY,
+    RecordingJob.Status.CUTTING_AUDIO,
+    RecordingJob.Status.WRITING_COURSE,
     RecordingJob.Status.FAILED,
 )
 
-# The service may only update a job while it is queued or running. A job waiting for the author's
-# speaker labels is neither: it leaves the queue and comes back once the author has tagged the voices.
+# The service may only update a job while it is queued or running. A job waiting for the author (to tag
+# the voices, or to shape the course) is neither: it leaves the queue and comes back once the author is done.
 ACTIVE_STATUSES = (
     RecordingJob.Status.QUEUED,
     RecordingJob.Status.CLEANING,
     RecordingJob.Status.FINDING_SPEAKERS,
     RecordingJob.Status.TRANSCRIBING,
+    RecordingJob.Status.SUGGESTING,
+    RecordingJob.Status.CUTTING_AUDIO,
+    RecordingJob.Status.WRITING_COURSE,
 )
