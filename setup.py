@@ -91,6 +91,7 @@ setup(
             "user_extension = user_extension.apps:UserExtensionConfig",
             "ai_course_creator = ai_course_creator.apps:AiCourseCreatorConfig",
             "course_schedule = course_schedule.apps:CourseScheduleConfig",
+            "course_from_recording = course_from_recording.apps:CourseFromRecordingConfig",
         ],
     },
 )

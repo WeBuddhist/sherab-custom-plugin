@@ -1,19 +1,22 @@
 """
-Thin wrapper around the Gemini API (google-genai SDK) for the Sherab course-creator chatbot.
+Thin wrapper around the AI model for the Sherab course-creator chatbot, reached through OpenRouter
+(https://openrouter.ai), which serves Google's Gemini models (and others) behind one OpenAI-style API.
 
 The bundled skill (``skill/SKILL.md`` + ``skill/references/*.md``) is used as the
 system instruction so the model behaves exactly like the "Sherab" persona.
 
-Credentials come from Django settings (``GEMINI_API_KEY`` / ``GEMINI_MODEL``),
+Credentials come from Django settings (``OPENROUTER_API_KEY`` / ``OPENROUTER_MODEL``),
 which Tutor injects from ``config.yml``. See settings/common.py.
 
-Uses the ``google-genai`` package (the replacement for the deprecated
-``google-generativeai`` package).
+Plain HTTP calls with ``requests`` (no provider SDK): one call streams the chat reply, the other
+returns a JSON object for the course generator.
 """
 
 import logging
 import os
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 
 from django.conf import settings
@@ -102,116 +105,135 @@ def _load_system_instruction(skill_name="skill"):
     return "\n".join(parts)
 
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
+# Shown in the OpenRouter account's activity list, to tell this app's use apart.
+APP_TITLE = "WeBuddhist Sherab course creator"
+# Connect / read timeouts (s). A long generation streams or answers within this.
+REQUEST_TIMEOUT = (10, 180)
+
+
+class LLMHTTPError(Exception):
+    """OpenRouter (or the model behind it) answered with an error."""
+
+    def __init__(self, status, message, retry_after=None):
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+        self.retry_after = retry_after
+
+
 def _get_api_key():
-    key = getattr(settings, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    key = getattr(settings, "OPENROUTER_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
     if not key:
         raise LLMNotConfigured(
-            "GEMINI_API_KEY is not set. Add it to Tutor config.yml and re-run `tutor config save`."
+            "OPENROUTER_API_KEY is not set. Add it to Tutor config.yml and re-run `tutor config save`."
         )
     return key
 
 
 def _get_model_name():
     return (
-        getattr(settings, "GEMINI_MODEL", "")
-        or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        getattr(settings, "OPENROUTER_MODEL", "")
+        or os.environ.get("OPENROUTER_MODEL", "")
+        or DEFAULT_MODEL
     )
 
 
-def _build_client():
-    """Instantiate a google-genai Client (imported lazily so the app loads without the dep)."""
-    from google import genai  # pylint: disable=import-outside-toplevel
-    return genai.Client(api_key=_get_api_key())
-
-
-def _to_contents(history, materials_context=""):
+def _to_messages(history, materials_context="", system_instruction=""):
     """
-    Convert our stored chat messages to the google-genai contents format.
-
-    Gemini uses "user" and "model" roles ("assistant" → "model").
-    The materials digest is prepended to the last user turn only.
-    Gemini requires non-empty content; empty opening triggers become ".".
+    Convert our stored chat messages to OpenAI-style chat messages (system, user, assistant).
+    The materials digest is prepended to the last user turn only; empty turns (an opening
+    trigger) become "." since models refuse empty content.
     """
-    result = []
+    result = [{"role": "system", "content": system_instruction}] if system_instruction else []
     for i, message in enumerate(history):
         role = message["role"] if isinstance(message, dict) else message.role
         content = message["content"] if isinstance(message, dict) else message.content
-        gemini_role = "model" if role == "assistant" else "user"
         if materials_context and i == len(history) - 1 and role == "user":
             content = (
                 f"[Course materials the creator has shared so far:\n{materials_context}\n]\n\n{content}"
             )
-        result.append({"role": gemini_role, "parts": [{"text": content or "."}]})
+        result.append({"role": "assistant" if role == "assistant" else "user", "content": content or "."})
     return result
+
+
+def _post(body, stream=False):
+    """POST a chat completion to OpenRouter; raises LLMHTTPError for an error answer."""
+    import requests  # pylint: disable=import-outside-toplevel
+
+    resp = requests.post(
+        OPENROUTER_URL,
+        json={**body, "model": _get_model_name(), "stream": stream},
+        headers={"Authorization": f"Bearer {_get_api_key()}", "X-Title": APP_TITLE},
+        timeout=REQUEST_TIMEOUT,
+        stream=stream,
+    )
+    if resp.status_code != 200:
+        try:
+            message = resp.json().get("error", {}).get("message", "")
+        except ValueError:
+            message = resp.text[:300]
+        raise LLMHTTPError(resp.status_code, message, _retry_after_header(resp.headers.get("retry-after")))
+    return resp
+
+
+def _retry_after_header(value):
+    """Seconds to wait from a Retry-After header: a number of seconds or an HTTP date. None if missing or odd."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:  # HTTP dates are GMT
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _error_in(payload):
+    """An error OpenRouter reports inside an answer (it can, even with HTTP 200)."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if error:
+        return LLMHTTPError(error.get("code") or 500, error.get("message", ""))
+    return None
 
 
 def _is_rate_limit(exc):
     if _is_too_large(exc):
         return False
-    try:
-        from google.api_core.exceptions import ResourceExhausted  # noqa, pylint: disable=import-outside-toplevel
-        if isinstance(exc, ResourceExhausted):
-            return True
-    except ImportError:
-        pass
-    name = type(exc).__name__
+    if isinstance(exc, LLMHTTPError):
+        return exc.status == 429
     text = str(exc).lower()
-    return (
-        name == "ResourceExhausted"
-        or "429" in text
-        or "resource_exhausted" in text
-        or "quota_exceeded" in text
-        or "rate_limit" in text
-    )
+    return "429" in text or "rate limit" in text or "rate_limit" in text
 
 
 def _is_server_unavailable(exc):
-    """True for transient 503 / high-demand errors that are worth retrying."""
-    text = str(exc).lower()
-    return (
-        "503" in text
-        or "service unavailable" in text
-        or "high demand" in text
-        or "unavailable" in text
-    )
+    """True for transient errors worth retrying: the provider down or busy, or the connection dropped."""
+    import requests  # pylint: disable=import-outside-toplevel
+
+    # ChunkedEncodingError: the connection was cut while the answer was streaming in.
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError)):
+        return True
+    return isinstance(exc, LLMHTTPError) and exc.status in (500, 502, 503, 504)
 
 
 def _is_too_large(exc):
     text = str(exc).lower()
-    return "413" in text or "too large" in text or "request_too_large" in text or "payload_too_large" in text
+    return (
+        (isinstance(exc, LLMHTTPError) and exc.status == 413)
+        or "too large" in text
+        or "context length" in text
+        or "maximum context" in text
+    )
 
 
 def _retry_after_seconds(exc, default):
-    """Extract the suggested wait time from a Gemini 429 error."""
-    import re  # pylint: disable=import-outside-toplevel
-
-    details_fn = getattr(exc, "details", None)
-    if callable(details_fn):
-        try:
-            for detail in details_fn():
-                delay = getattr(detail, "retry_delay", None)
-                if delay is not None:
-                    return delay.seconds + delay.nanos / 1e9
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-    resp = getattr(exc, "response", None)
-    headers = getattr(resp, "headers", None) or {}
-    try:
-        ra = headers.get("retry-after")
-        if ra:
-            return float(ra)
-    except (TypeError, ValueError):
-        pass
-
-    match = re.search(r"(?:retry after|try again in|wait)\s*([\d.]+)\s*s", str(exc), re.IGNORECASE)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            pass
-
-    return default
+    """The wait OpenRouter suggests for a 429 (Retry-After), or ``default``."""
+    return getattr(exc, "retry_after", None) or default
 
 
 CHAT_MAX_TOKENS = 1024
@@ -224,9 +246,37 @@ CHAT_MAX_RETRIES = 5
 CHAT_RATE_LIMIT_MAX_WAIT = 30
 
 
+def _stream_chunks(resp):
+    """The text of an OpenRouter stream (server-sent events), chunk by chunk."""
+    import json  # pylint: disable=import-outside-toplevel
+
+    # The stream is UTF-8; without a charset in its Content-Type, requests would read text/* as Latin-1 and
+    # garble every non-ASCII character (Tibetan included).
+    resp.encoding = "utf-8"
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or line.startswith(":"):  # keep-alive comments, e.g. ": OPENROUTER PROCESSING"
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        error = _error_in(payload)
+        if error:
+            raise error
+        for choice in payload.get("choices") or []:
+            text = (choice.get("delta") or {}).get("content") or ""
+            if text:
+                yield text
+
+
 def stream_reply(history, materials_context="", skill_name="skill", max_tokens=CHAT_MAX_TOKENS):
     """
-    Stream the assistant's reply token-by-token using the Gemini streaming API.
+    Stream the assistant's reply token-by-token.
 
     ``skill_name`` selects the system instruction (skill dir) to use.
     ``max_tokens`` caps the output (larger for the section editor, which embeds
@@ -235,31 +285,22 @@ def stream_reply(history, materials_context="", skill_name="skill", max_tokens=C
     Yields:
         str chunks of assistant text.
     """
-    from google.genai import types  # pylint: disable=import-outside-toplevel
-
-    client = _build_client()
-    contents = _to_contents(history, materials_context)
-
-    config = types.GenerateContentConfig(
-        system_instruction=_load_system_instruction(skill_name),
-        temperature=0.7,
-        max_output_tokens=max_tokens,
-    )
+    body = {
+        "messages": _to_messages(history, materials_context, _load_system_instruction(skill_name)),
+        "temperature": 0.7,
+        "max_tokens": max_tokens,
+    }
 
     last_exc = None
     for attempt in range(CHAT_MAX_RETRIES):
+        sent_any = False
         try:
-            response = client.models.generate_content_stream(
-                model=_get_model_name(),
-                contents=contents,
-                config=config,
-            )
-            for chunk in response:
-                text = getattr(chunk, "text", "") or ""
-                if text:
+            with _post(body, stream=True) as resp:
+                for text in _stream_chunks(resp):
+                    sent_any = True
                     yield text
             return
-        except LLMError:
+        except (LLMError, LLMNotConfigured):
             raise
         except Exception as exc:  # pylint: disable=broad-except
             last_exc = exc
@@ -268,11 +309,12 @@ def stream_reply(history, materials_context="", skill_name="skill", max_tokens=C
                     "There's too much material for one request. Remove or shorten some "
                     "uploaded materials and try again."
                 ) from exc
-            if attempt < CHAT_MAX_RETRIES - 1:
+            # Once part of the reply was shown, asking again would repeat it: stop with the error instead.
+            if attempt < CHAT_MAX_RETRIES - 1 and not sent_any:
                 if _is_rate_limit(exc):
                     wait = min(_retry_after_seconds(exc, default=8 * (attempt + 1)) + 1, CHAT_RATE_LIMIT_MAX_WAIT)
                     log.warning(
-                        "ai_course_creator: Gemini rate limited (chat), waiting %.1fs (attempt %d/%d)",
+                        "ai_course_creator: AI model rate limited (chat), waiting %.1fs (attempt %d/%d)",
                         wait, attempt + 1, CHAT_MAX_RETRIES,
                     )
                     time.sleep(wait)
@@ -280,8 +322,8 @@ def stream_reply(history, materials_context="", skill_name="skill", max_tokens=C
                 if _is_server_unavailable(exc):
                     wait = min(4 * (attempt + 1), 20)
                     log.warning(
-                        "ai_course_creator: Gemini unavailable (503), retrying in %.1fs (attempt %d/%d)",
-                        wait, attempt + 1, CHAT_MAX_RETRIES,
+                        "ai_course_creator: AI model unavailable (%s), retrying in %.1fs (attempt %d/%d)",
+                        exc, wait, attempt + 1, CHAT_MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
@@ -302,42 +344,33 @@ def complete_json(
     Returns:
         str: the raw JSON text from the model.
     """
-    from google.genai import types  # pylint: disable=import-outside-toplevel
-
-    client = _build_client()
     sys_instr = system_instruction if system_instruction is not None else _load_system_instruction()
-
-    contents = _to_contents(history, materials_context)
-    contents.append({"role": "user", "parts": [{"text": instruction}]})
-
-    config_kwargs = {
-        "system_instruction": sys_instr,
-        "temperature": temperature,
-        "response_mime_type": "application/json",
-    }
+    messages = _to_messages(history, materials_context, sys_instr)
+    messages.append({"role": "user", "content": instruction})
+    body = {"messages": messages, "temperature": temperature, "response_format": {"type": "json_object"}}
     if max_tokens:
-        config_kwargs["max_output_tokens"] = max_tokens
-
-    config = types.GenerateContentConfig(**config_kwargs)
+        body["max_tokens"] = max_tokens
 
     last_exc = None
     for attempt in range(JSON_MAX_RETRIES):
         try:
-            response = client.models.generate_content(
-                model=_get_model_name(),
-                contents=contents,
-                config=config,
-            )
-            return response.text or ""
+            payload = _post(body).json()
+            error = _error_in(payload)
+            if error:
+                raise error
+            choice = (payload.get("choices") or [{}])[0]
+            return (choice.get("message") or {}).get("content") or ""
+        except LLMNotConfigured:
+            raise
         except Exception as exc:  # pylint: disable=broad-except
             last_exc = exc
             if _is_too_large(exc):
                 raise LLMError(_friendly_llm_error(exc)) from exc
-            if _is_rate_limit(exc) and attempt < JSON_MAX_RETRIES - 1:
+            if attempt < JSON_MAX_RETRIES - 1 and (_is_rate_limit(exc) or _is_server_unavailable(exc)):
                 wait = min(_retry_after_seconds(exc, default=10 * (attempt + 1)) + 1, RATE_LIMIT_MAX_WAIT)
                 log.warning(
-                    "ai_course_creator: Gemini rate limited (json), waiting %.1fs (attempt %d/%d)",
-                    wait, attempt + 1, JSON_MAX_RETRIES,
+                    "ai_course_creator: AI model busy or unavailable (json: %s), waiting %.1fs (attempt %d/%d)",
+                    exc, wait, attempt + 1, JSON_MAX_RETRIES,
                 )
                 time.sleep(wait)
                 continue
@@ -354,12 +387,14 @@ def _friendly_llm_error(exc):
         )
     if _is_rate_limit(exc):
         return "Sherab is busy right now — the AI service is rate-limited. Please wait a moment and try again."
-    text = str(exc).lower()
-    if "401" in text or "403" in text or "api_key" in text or "authentication" in text or "invalid_api_key" in text:
+    status = getattr(exc, "status", None)
+    if status == 402:
+        log.error("ai_course_creator: the OpenRouter account is out of credit: %s", exc)
+        return "Sherab's AI service has run out of credit. Please contact your platform administrator."
+    if status in (401, 403, 404):
+        log.error("ai_course_creator: OpenRouter refused the key or model: %s", exc)
         return "Sherab couldn't connect to the AI service. Please contact your platform administrator."
-    if "404" in text:
-        return "Sherab couldn't connect to the AI service. Please contact your platform administrator."
-    log.exception("ai_course_creator: unexpected LLM error")
+    log.error("ai_course_creator: unexpected LLM error: %s", exc)
     return "Sherab ran into a problem. Please try again in a moment."
 
 

@@ -2,13 +2,14 @@
 
 Custom Open edX plugins for the **Sherab / WeBuddhist Academy** platform, packaged
 together as a single installable distribution (`custom-extensions`). The package
-bundles five independent Django apps that plug into the LMS and/or CMS via the
+bundles six independent Django apps that plug into the LMS and/or CMS via the
 [Open edX plugin framework](https://edx.readthedocs.io/projects/edx-django-utils/en/latest/edx_django_utils.plugins.html)
 (`edx_django_utils.plugins`) — no edx-platform core code is modified.
 
 | App | Runs in | Purpose |
 | --- | --- | --- |
-| [`ai_course_creator`](#ai_course_creator) | CMS (Studio) | Conversational AI ("Sherab") that designs and generates whole courses, and edits existing sections, using Google Gemini. |
+| [`ai_course_creator`](#ai_course_creator) | CMS (Studio) | Conversational AI ("Sherab") that designs and generates whole courses, and edits existing sections, using Google Gemini through OpenRouter. |
+| [`course_from_recording`](#course_from_recording) | CMS (Studio) | Jobs for the "From a teaching recording" tool: upload links, the studio tool service's queue, and progress. |
 | [`course_schedule`](#course_schedule) | LMS + CMS | Per-section schedule (dates, times, instructor, tools, notes) set in the Studio outline and shown on the learner Dates tab. |
 | [`course_partnerships`](#course_partnerships) | LMS | Partner organizations, centers, categories, and course-creator profiles, with branding assets and a mobile API. |
 | [`user_extension`](#user_extension) | LMS | Extends user profiles with partner relationships; auto-approves ID verification on registration. |
@@ -26,7 +27,6 @@ and listed as an extra pip requirement so it is picked up on image build / dev m
 ```yaml
 OPENEDX_EXTRA_PIP_REQUIREMENTS:
   - google-api-python-client
-  - google-genai
 MOUNTS:
   - /path/to/sherab-custom-plugin   # dev: live-mounted into LMS & CMS
 ```
@@ -37,7 +37,7 @@ and installed automatically by `setup.py`.
 The apps register through the entry points in [`setup.py`](setup.py):
 
 ```
-cms.djangoapp:  ai_course_creator, course_partnerships, course_schedule, user_extension
+cms.djangoapp:  ai_course_creator, course_from_recording, course_partnerships, course_schedule, user_extension
 lms.djangoapp:  course_partnerships, course_schedule, user_extension, wishlist
 ```
 
@@ -55,7 +55,7 @@ tutor dev exec lms ./manage.py lms migrate course_partnerships
 A **Studio-only (CMS)** conversational assistant — "Sherab" — that helps a course
 creator design a course through chat, then generates the real Open edX course
 structure for them. It also powers a per-section "Edit with SherabAI" sidebar for
-improving an existing section. All LLM calls are **server-side only**; the Gemini
+improving an existing section. All LLM calls are **server-side only**; the OpenRouter
 API key is never sent to the browser.
 
 ### Two flows
@@ -84,7 +84,8 @@ creator clicks **Apply changes**, and edits are strictly scoped to that one sect
   - `UploadedMaterial` — course material shared by the creator (file/link/text),
     stored as extracted plain text (the binary is not retained).
 
-- **`services/llm_client.py`** — thin wrapper over the `google-genai` SDK. Streams
+- **`services/llm_client.py`** — thin wrapper over the AI model, reached through
+  [OpenRouter](https://openrouter.ai) (OpenAI-style chat completions, plain `requests`). Streams
   replies (`stream_reply`), makes JSON-mode generation calls (`complete_json`), loads
   the bundled skill as the system instruction, and parses/strips the embedded
   `COURSE_JSON` and `SECTION_EDITS` marker blocks. Handles rate-limit (429), 503
@@ -141,14 +142,14 @@ author access. Mounted at the site root, so paths are absolute on the Studio hos
 
 ### Settings
 
-Defaults are set in `settings/common.py` / `settings/production.py`; the Gemini
+Defaults are set in `settings/common.py` / `settings/production.py`; the OpenRouter
 credentials are normally injected into CMS settings from Tutor `config.yml` via the
 `configuration_plugin` patch.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | `""` | Google Gemini API key (server-side only). |
-| `GEMINI_MODEL` | `gemini-1.5-pro` | Model id (e.g. `gemini-2.5-flash-lite`). |
+| `OPENROUTER_API_KEY` | `""` | OpenRouter API key (server-side only). |
+| `OPENROUTER_MODEL` | `google/gemini-2.5-flash-lite` | OpenRouter model id (any model on openrouter.ai/models). |
 | `AI_COURSE_CREATOR_ENABLED` | `True` | Master on/off switch for the feature. |
 | `AI_COURSE_CREATOR_MAX_UPLOAD_BYTES` | `25 MB` | Max uploaded-material size. |
 | `AI_COURSE_CREATOR_MAX_CONTEXT_CHARS` | `16000` | Max material text per request. |
@@ -156,8 +157,8 @@ credentials are normally injected into CMS settings from Tutor `config.yml` via 
 Tutor wiring — set the values in `config.yml`:
 
 ```yaml
-GEMINI_API_KEY: "AQ.xxxxxxxx"
-GEMINI_MODEL: gemini-2.5-flash-lite
+OPENROUTER_API_KEY: "sk-or-v1-xxxxxxxx"
+OPENROUTER_MODEL: google/gemini-2.5-flash-lite
 ```
 
 and inject them into CMS settings in `configuration_plugins.yml`:
@@ -165,8 +166,8 @@ and inject them into CMS settings in `configuration_plugins.yml`:
 ```yaml
 patches:
   openedx-cms-production-settings: |
-    GEMINI_API_KEY = "{{ GEMINI_API_KEY }}"
-    GEMINI_MODEL = "{{ GEMINI_MODEL }}"
+    OPENROUTER_API_KEY = "{{ OPENROUTER_API_KEY|default('') }}"
+    OPENROUTER_MODEL = "{{ OPENROUTER_MODEL|default('google/gemini-2.5-flash-lite') }}"
 ```
 
 then `tutor config save` and restart CMS.
@@ -176,6 +177,134 @@ then `tutor config save` and restart CMS.
 
 The matching frontend lives in the **`frontend-app-authoring`** MFE under
 `src/ai-course-creator/` (the creator modal and the section-editor sidebar).
+
+---
+
+## `course_from_recording`
+
+**CMS-only.** The Studio side of the "From a teaching recording" tool. A course
+author uploads a teaching recording, and the **studio tool service** (a separate
+container from the `wb-academy-studio-tool-service` repo) cleans it, finds the
+speakers and transcribes it in the background. With more than one speaker (a
+teacher and a translator) only the teacher is transcribed; with one, the whole recording. The heavy audio work never runs
+inside Open edX; this app only keeps track of the jobs.
+
+Once the author has checked the transcript, the service suggests a course (Gemini through OpenRouter: sections, lessons,
+summaries, key points, questions), the author shapes it, and this app writes it into the course as an
+unpublished draft, with the AI course creator's builder (`ai_course_creator/services/course_builder.py`).
+Each lesson's audio is copied to the public assets bucket, where the course's players load it.
+
+- **Uploads go straight to S3.** The API returns a signed upload link for one file,
+  with its content type and size in the signature, so the recording never passes
+  through Studio and S3 refuses any other file.
+- **Files** live in the private Open edX bucket, one folder per course and one per
+  recording, chosen when the job is created and saved on it (`folder`):
+  `studio-tools/course-from-recording/<course>/<date>_<file name>_<short id>/`, e.g.
+  `studio-tools/course-from-recording/Sherab-tspc12-2026/2026-11-03_audio-tibetan_a101e248/`.
+  Inside it, one numbered folder per step: `0-original/` (the upload, never changed),
+  `1-voices/` (only with more than one speaker), `2-clean/`, `3-transcript/`, plus a
+  `job.json` summary written by the service. Names are lowercase ASCII with dashes; a
+  file name with nothing left (e.g. all Tibetan) becomes `recording`.
+- **Queue:** starting a job pushes `course_from_recording:<job id>` onto the
+  service's Redis list. The service trusts only the id and reads the rest from
+  this app, so a queue entry this app didn't create leads nowhere.
+
+### Models
+
+- `RecordingJob`: one row per recording. Random UUID id (also its S3 folder),
+  course, user, `status`, `progress` (0-100 for the current step), `error`, the
+  author's `metadata` (teacher, `multiple_speakers`, `teacher_language`,
+  `translator_language`, text, place, year), the declared file name, type and size,
+  `duration_seconds`, `transcribed_minutes` (Monlam and Gemini cost tracking),
+  `results` (output name → path inside the job folder), and for recordings with more
+  than one speaker `speaker_groups` (the voices the service found, with sample clips)
+  and `speaker_labels` (the author's tag for each: teacher, translator, chanting, other).
+
+  Statuses with more than one speaker: `uploading` → `queued` → `finding_speakers` →
+  `needs_speaker_labels` → `queued` → `cleaning` → `transcribing` → `transcript_ready`.
+  With one speaker, speaker detection is skipped: `uploading` → `queued` → `cleaning` →
+  `transcribing` → `transcript_ready`. Any step can end in `failed`. While a job waits
+  for the author's tags it is off the queue; tagging puts it back. The API doesn't
+  enforce this order; the service follows it.
+
+  Then the course: `transcript_ready` → `queued` → `suggesting` → `course_draft_ready` (the
+  author shapes it) → `queued` → `cutting_audio` → `writing_course` → `course_ready`. The draft is
+  `course_draft` (sections of lessons; each lesson a range of transcript lines, its title,
+  summary, key points, multiple-choice questions and reflection questions, and whether it is
+  kept), `course_approved_at` records the author's confirmation that the teacher has reviewed
+  it, and `course_sections` the sections written into the course.
+- **The written course.** Each lesson kept is a subsection of four units: Listen (the Tibetan
+  and translator tracks, then the teacher's own words with the author's corrections), Key
+  points, Check (one ungraded multiple-choice Problem per question, with no try limit of its own:
+  the course's "Maximum Attempts" advanced setting applies, unlimited while it is empty) and
+  Reflect. Sections are added at the end of the outline; nothing is published. If any page
+  can't be made, everything written is removed and the job fails. The page names
+  are Tibetan, in `course.LABELS`. The audio goes to
+  `<PUBLIC_BUCKET>/course-audio/<course>/<job folder name>/`; it belongs to the course, so
+  starting over never deletes it.
+- **Starting over.** From any step the author can start over: the job becomes `cancelled`,
+  its files are deleted from S3, and the recording too unless the author keeps it
+  (`recording_kept`). A kept recording is moved into a new job's folder by
+  `reuse-recording/`, so it isn't uploaded again. The service learns of it from its next
+  progress report (refused with `409` and `"status": "cancelled"`), stops, and deletes what it
+  wrote since. The job row stays, with its `transcribed_minutes`, for cost tracking.
+
+### Components
+
+- `services.py`: everything that leaves Open edX: signed S3 links, checking the
+  upload, reading the transcript, copying lesson audio to the public bucket, and the Redis queue.
+- `course.py`: writes the approved draft into the course with `apply_course_json`, and removes
+  it again if a page could not be written.
+- `views.py`: the Studio API for the studio-extension MFE. Course authors only.
+- `views_service.py`: the service's API. No user login: every request needs the
+  shared secret in the `X-Service-Token` header, compared in constant time. The
+  service may only report its own steps, only while a job is queued or running,
+  and only output paths inside the job's folder.
+
+### API endpoints
+
+| Who | Method | Path | Purpose |
+| --- | --- | --- | --- |
+| Author | POST | `/api/course-from-recording/v1/jobs/` | Create a job: `{course_id, filename, content_type, size, consent, details: {teacher, multiple_speakers, teacher_language, translator_language?, text?, place?, year?}}`. `teacher_language` must be `bo` (Tibetan, transcribed by Monlam AI) or `en` (English, transcribed by Gemini); anything else is refused as not supported yet. Returns the job and `upload: {method, url, headers}`. |
+| Author | GET | `/api/course-from-recording/v1/jobs/?course_id=...` | The course's latest job, or `null`, so the tool page can resume. |
+| Author | GET | `/api/course-from-recording/v1/jobs/<id>/` | One job, with short-lived `downloads` links to its outputs and to each speaker group's sample clips. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/start/` | Check the upload is in S3 with the declared size, then queue the job. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/speakers/` | Tag the voices: `{labels: {group: "teacher" \| "translator" \| "chanting" \| "other"}}`. Every group needs a tag and at least one must be the teacher (one voice is sometimes split into two groups). Queues the job again. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/retry/` | Queue a failed job again; the service continues from the step that failed. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/start-over/` | `{"keep_recording": true}`: stop the job (`cancelled`) and delete its files from S3, the recording too unless kept. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/reuse-recording/` | `{"consent": true, "details": {...}}`: a new job with the recording a started-over job kept, queued straight away. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/transcript-edits/` | `{"line": 4, "text": "..."}`: the author's correction of one transcript line (`text: null` undoes it). Only at `transcript_ready`. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/suggest/` | Only at `transcript_ready`: queue the job to suggest a course. |
+| Author | PUT | `/api/course-from-recording/v1/jobs/<id>/course-draft/` | The whole draft, with the author's changes (titles, `include`, summaries, key points, questions). Only at `course_draft_ready`; sections, lessons and their line ranges can't change. |
+| Author | POST | `/api/course-from-recording/v1/jobs/<id>/build/` | `{"approved": true}` (the teacher has reviewed the outline): at least one lesson kept; queues the job to cut the audio and write the course. |
+| Service | GET | `/api/course-from-recording/v1/service/jobs/<id>/` | Job details, its S3 folder, the recording's key, the speaker groups and the author's tags, and the course draft and whether it was approved. |
+| Service | PATCH | `/api/course-from-recording/v1/service/jobs/<id>/` | Progress report: any of `status`, `progress`, `error`, `results` (merged), `duration_seconds`, `transcribed_minutes`, `speaker_groups`, `course_draft`. `needs_speaker_labels` is accepted only for multi-speaker recordings and with the groups; `course_draft_ready` only with the draft. |
+| Service | POST | `/api/course-from-recording/v1/service/jobs/<id>/course/` | `{"lessons": {lesson id: {"tracks": {"bo": path, "translator": path}}}}` once the clips are cut, at `writing_course`: copy them to the public bucket and write the course. Every lesson needs its `bo` track. Runs outside a database transaction, one request at a time: a course still being written answers `503` (ask again later), one already written is answered as it is; a failure marks the job `failed` (still `200`). |
+
+### Settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `STUDIO_TOOL_SERVICE` | `{}` | `REDIS_URL`, `QUEUE`, `BUCKET`, `PREFIX`, `TOKEN`, `MAX_RECORDING_MINUTES`, and for the course audio `PUBLIC_BUCKET` and `PUBLIC_URL` (by default the partner-logo bucket and its domain). Set by the `studio_tool_service` Tutor plugin; while it is incomplete the author API answers 503 (without the public bucket, only writing a course fails). |
+| `COURSE_FROM_RECORDING_MAX_UPLOAD_MB` | `2048` | Largest recording an author can upload. |
+
+S3 access uses Studio's own settings and key from `tutor-contrib-s3`
+(`AWS_S3_REGION_NAME`, `AWS_ACCESS_KEY_ID`, ...). The bucket's CORS rule must allow
+`PUT` from the MFE host.
+
+### Frontend
+
+- Entry point: the "Create with a tool" menu in the empty course outline
+  (`frontend-app-authoring` `src/plugin-slots/CourseOutlineCreateToolsSlot/` and
+  `src/plugins/RecordingCourseTool/`).
+- Tool page: `frontend-app-studio-extension`, route `/course-from-recording/:courseId`.
+
+### Tests
+
+```bash
+tutor dev exec cms python -m pytest -c cms/pytest.ini --ds=cms.envs.test --rootdir=/openedx/edx-platform -p conftest \
+    /mnt/sherab-custom-plugin/course_from_recording/tests/
+```
 
 ---
 
