@@ -65,7 +65,9 @@ class PartnerDetailView(View):
             .annotate(num_courses=Count("enhancedcourse"))
             .filter(num_courses__gt=0)
         )
-        partner_courses = CourseOverview.objects.filter(enhancedcourse__partner=partner)
+        partner_courses = CourseOverview.objects.filter(enhancedcourse__partner=partner).order_by(
+            "enhancedcourse__display_order", "display_name", "id"
+        )
         course_creators = CourseCreator.objects.filter(partner=partner)
         context = {
             "partner": partner,
