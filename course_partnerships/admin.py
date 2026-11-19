@@ -23,7 +23,10 @@ class CategoryAdmin(admin.ModelAdmin):
 
 
 class EnhancedCourseAdmin(admin.ModelAdmin):
-    list_display = ["course", "partner", "center", "category"]
+    list_display = ["course", "partner", "center", "category", "display_order"]
+    list_editable = ["display_order"]
+    list_filter = ["partner"]
+    ordering = ["partner__name", "display_order", "course__display_name"]
     search_fields = ["course_id"]
     raw_id_fields = ["course", "partner", "center", "category"]
 

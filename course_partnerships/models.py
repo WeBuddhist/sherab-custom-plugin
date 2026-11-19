@@ -142,6 +142,11 @@ class EnhancedCourse(TimeStampedModel):
     partner = models.ForeignKey(Partner, null=True, blank=True, db_index=True, on_delete=models.SET(""))
     center = models.ForeignKey(Center, null=True, blank=True, db_index=True, on_delete=models.SET(""))
     category = models.ForeignKey(Category, null=True, blank=True, db_index=True, on_delete=models.SET(""))
+    display_order = models.PositiveIntegerField(
+        _("School page order"),
+        default=0,
+        help_text=_("Lower numbers are shown first on the school/partner page."),
+    )
 
     class Meta:
         app_label = "course_partnerships"
