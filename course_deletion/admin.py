@@ -13,7 +13,9 @@ from django.utils.decorators import method_decorator
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
+from search.search_engine_base import SearchEngine
 
+from cms.djangoapps.contentstore.courseware_index import CourseAboutSearchIndexer
 from cms.djangoapps.contentstore.utils import delete_course
 from common.djangoapps.student.models import CourseEnrollment
 from openedx.core.djangoapps.content.course_overviews.admin import CourseOverviewAdmin
@@ -99,9 +101,13 @@ class SherabCourseOverviewAdmin(CourseOverviewAdmin):
                 )
                 try:
                     delete_course(course_overview.id, request.user.id)
-                    self.log_deletions(request, [course_overview])
+                    # The platform deletion signal filters by course, which Meilisearch does not allow.
+                    searcher = SearchEngine.get_search_engine(CourseAboutSearchIndexer.INDEX_NAME)
+                    if searcher:
+                        searcher.remove([str(course_overview.id)])
                     if remove_assets:
                         contentstore().delete_all_course_assets(course_overview.id)
+                    self.log_deletions(request, [course_overview])
                 except Exception:  # pylint: disable=broad-except
                     log.exception(
                         "Course deletion failed: course=%s actor=%s",

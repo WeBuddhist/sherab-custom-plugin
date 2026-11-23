@@ -52,12 +52,14 @@ class CourseOverviewDeletionAdminTest(ModuleStoreTestCase):
         self.assertContains(response, "Enter the complete course ID exactly as shown.")
         delete_course_mock.assert_not_called()
 
+    @mock.patch("course_deletion.admin.SearchEngine.get_search_engine")
     @mock.patch("course_deletion.admin.delete_course")
-    def test_delete_uses_platform_service_and_writes_admin_log(self, delete_course_mock):
+    def test_delete_uses_platform_service_and_writes_admin_log(self, delete_course_mock, search_engine_mock):
         response = self.client.post(self.url, {"confirmation": str(self.course.id)})
 
         assert response.status_code == 302
         delete_course_mock.assert_called_once_with(self.course.id, self.user.id)
+        search_engine_mock.return_value.remove.assert_called_once_with([str(self.course.id)])
         assert LogEntry.objects.filter(
             user=self.user,
             object_id=str(self.course.id),
