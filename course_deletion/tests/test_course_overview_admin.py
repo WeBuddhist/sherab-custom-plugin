@@ -2,6 +2,7 @@
 
 from unittest import mock
 
+from django.contrib import admin
 from django.contrib.admin.models import DELETION, LogEntry
 from django.contrib.admin.utils import quote
 from django.test import Client
@@ -28,8 +29,29 @@ class CourseOverviewDeletionAdminTest(ModuleStoreTestCase):
         assert self.client.login(username=self.user.username, password=self.user_password)
         self.url = reverse(
             "admin:course_overviews_courseoverview_delete_course",
-            args=[quote(self.course.id)],
+            args=[quote(str(self.course.id))],
         )
+
+    def test_platform_columns_are_preserved(self):
+        fields = admin.site._registry[CourseOverview].get_list_display(self.client.get(self.url).wsgi_request)
+
+        assert fields == [
+            "id", "display_name", "version", "enrollment_start", "enrollment_end",
+            "created", "modified", "delete_course_link",
+        ]
+
+    def test_course_id_with_underscore_has_working_delete_link(self):
+        course = CourseFactory.create(org="Org", number="CS101", run="2025_26", emit_signals=True)
+        overview = CourseOverview.objects.get(id=course.id)
+        url = reverse("admin:course_overviews_courseoverview_delete_course", args=[quote(str(course.id))])
+
+        assert "_5F" in admin.site._registry[CourseOverview].delete_course_link(overview)
+        assert self.client.get(url).status_code == 200
+
+    def test_invalid_course_key_returns_404(self):
+        url = reverse("admin:course_overviews_courseoverview_delete_course", args=["invalid-course-key"])
+
+        assert self.client.get(url).status_code == 404
 
     def test_confirmation_shows_active_and_total_enrollments(self):
         active_user = UserFactory()
@@ -81,6 +103,27 @@ class CourseOverviewDeletionAdminTest(ModuleStoreTestCase):
             action_flag=DELETION,
         ).exists()
 
+    @mock.patch("course_deletion.admin.contentstore")
+    @mock.patch("course_deletion.admin.SearchEngine.get_search_engine")
+    @mock.patch("course_deletion.admin.delete_course")
+    def test_cleanup_failures_keep_deletion_audit_and_report_warnings(
+        self, delete_course_mock, search_engine_mock, contentstore_mock,
+    ):
+        search_engine_mock.return_value.remove.side_effect = RuntimeError("search failed")
+        contentstore_mock.return_value.delete_all_course_assets.side_effect = RuntimeError("assets failed")
+
+        response = self.client.post(self.url, {
+            "confirmation": str(self.course.id),
+            "remove_assets": "on",
+        }, follow=True)
+
+        assert response.status_code == 200
+        delete_course_mock.assert_called_once_with(self.course.id, self.user.id)
+        contentstore_mock.return_value.delete_all_course_assets.assert_called_once_with(self.course.id)
+        assert LogEntry.objects.filter(user=self.user, object_id=str(self.course.id), action_flag=DELETION).exists()
+        self.assertContains(response, "The course was deleted, but its search entry could not be removed.")
+        self.assertContains(response, "The course was deleted, but its assets could not be removed.")
+
     def test_staff_without_delete_permission_is_forbidden(self):
         password = "staff-password"
         staff_user = UserFactory(is_staff=True, password=password)
@@ -93,7 +136,6 @@ class CourseOverviewDeletionAdminTest(ModuleStoreTestCase):
     def test_selected_asset_option(self, delete_course_mock, contentstore_mock):
         response = self.client.post(self.url, {
             "confirmation": str(self.course.id),
-            "keep_instructors": "on",
             "remove_assets": "on",
         })
 

@@ -13,6 +13,7 @@ from django.utils.decorators import method_decorator
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
+from opaque_keys import InvalidKeyError
 from search.search_engine_base import SearchEngine
 
 from cms.djangoapps.contentstore.courseware_index import CourseAboutSearchIndexer
@@ -58,7 +59,7 @@ class SherabCourseOverviewAdmin(CourseOverviewAdmin):
     def delete_course_link(self, obj):
         url = reverse(
             "admin:course_overviews_courseoverview_delete_course",
-            args=[quote(obj.pk)],
+            args=[quote(str(obj.pk))],
         )
         return format_html('<a class="button" style="white-space: nowrap" href="{}">{}</a>', url, _("Delete course"))
 
@@ -67,7 +68,10 @@ class SherabCourseOverviewAdmin(CourseOverviewAdmin):
         if not self._can_delete_courses(request):
             raise PermissionDenied
 
-        course_overview = self.get_object(request, unquote(object_id))
+        try:
+            course_overview = self.get_object(request, unquote(object_id))
+        except InvalidKeyError as exc:
+            raise Http404 from exc
         if course_overview is None:
             raise Http404
         course = modulestore().get_course(course_overview.id)
@@ -101,20 +105,15 @@ class SherabCourseOverviewAdmin(CourseOverviewAdmin):
                 )
                 try:
                     delete_course(course_overview.id, request.user.id)
-                    # The platform deletion signal filters by course, which Meilisearch does not allow.
-                    searcher = SearchEngine.get_search_engine(CourseAboutSearchIndexer.INDEX_NAME)
-                    if searcher:
-                        searcher.remove([str(course_overview.id)])
-                    if remove_assets:
-                        contentstore().delete_all_course_assets(course_overview.id)
-                    self.log_deletions(request, [course_overview])
                 except Exception:  # pylint: disable=broad-except
                     log.exception(
                         "Course deletion failed: course=%s actor=%s",
                         course_overview.id,
                         request.user.username,
                     )
-                    context["deletion_error"] = _("The operation did not complete. Check the server logs before retrying.")
+                    context["deletion_error"] = _(
+                        "The operation did not complete. Check the server logs before retrying."
+                    )
                     return TemplateResponse(
                         request,
                         "admin/course_overviews/delete_course_confirmation.html",
@@ -122,10 +121,28 @@ class SherabCourseOverviewAdmin(CourseOverviewAdmin):
                         status=500,
                     )
 
-                log.info(
-                    "Course deleted: course=%s actor=%s remove_assets=%s",
-                    course_overview.id, request.user.username, remove_assets,
-                )
+                self.log_deletions(request, [course_overview])
+                log.info("Course deleted: course=%s actor=%s", course_overview.id, request.user.username)
+
+                try:
+                    # The platform deletion signal filters by course, which Meilisearch does not allow.
+                    searcher = SearchEngine.get_search_engine(CourseAboutSearchIndexer.INDEX_NAME)
+                    if searcher:
+                        searcher.remove([str(course_overview.id)])
+                except Exception:  # pylint: disable=broad-except
+                    log.exception("Search cleanup failed for deleted course %s", course_overview.id)
+                    self.message_user(
+                        request, _("The course was deleted, but its search entry could not be removed."), messages.WARNING,
+                    )
+
+                if remove_assets:
+                    try:
+                        contentstore().delete_all_course_assets(course_overview.id)
+                    except Exception:  # pylint: disable=broad-except
+                        log.exception("Asset cleanup failed for deleted course %s", course_overview.id)
+                        self.message_user(
+                            request, _("The course was deleted, but its assets could not be removed."), messages.WARNING,
+                        )
                 self.message_user(
                     request,
                     _("Course %(course_id)s was deleted.") % {"course_id": course_overview.id},
