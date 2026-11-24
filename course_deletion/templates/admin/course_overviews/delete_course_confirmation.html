@@ -1,0 +1,67 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls %}
+
+{% block bodyclass %}{{ block.super }} app-{{ opts.app_label }} model-{{ opts.model_name }} delete-confirmation{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% translate "Home" %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+  &rsaquo; {% translate "Delete course" %}
+</div>
+{% endblock %}
+
+{% block content %}
+<p>{% blocktranslate with name=course.display_name %}You are about to delete “{{ name }}”.{% endblocktranslate %}</p>
+
+<ul>
+  <li><strong>{% translate "Course ID" %}:</strong> <code>{{ course.id }}</code></li>
+  <li><strong>{% translate "Active enrollments" %}:</strong> {{ active_enrollments }}</li>
+  <li><strong>{% translate "Total enrollment records" %}:</strong> {{ total_enrollments }}</li>
+</ul>
+
+<p class="errornote">
+  {% translate "This removes the course from Studio and the learner experience. It cannot be undone." %}
+</p>
+
+{% if deletion_error %}<p class="errornote">{{ deletion_error }}</p>{% endif %}
+
+<form method="post">
+  {% csrf_token %}
+  <fieldset class="module aligned">
+    <div class="form-row{% if confirmation_error %} errors{% endif %}">
+      {% if confirmation_error %}<ul class="errorlist"><li>{{ confirmation_error }}</li></ul>{% endif %}
+      <label class="required" for="id_confirmation">
+        {% translate "Enter the complete course ID to confirm" %}:
+      </label>
+      <input
+        id="id_confirmation"
+        name="confirmation"
+        type="text"
+        required
+        autocomplete="off"
+        size="60"
+        aria-describedby="course-id-help"
+      >
+      <div id="course-id-help" class="help"><code>{{ course.id }}</code></div>
+    </div>
+  </fieldset>
+
+  <fieldset class="module aligned">
+    <h2 class="fieldset-heading">{% translate "Deletion options" %}</h2>
+    <div class="form-row">
+      <div class="flex-container checkbox-row">
+        <input type="checkbox" id="id_remove_assets" name="remove_assets" value="on"{% if remove_assets_selected %} checked{% endif %} aria-describedby="remove-assets-help">
+        <label class="vCheckboxLabel" for="id_remove_assets">{% translate "Also remove course assets" %}</label>
+      </div>
+      <div class="help" id="remove-assets-help">{% translate "This can permanently remove assets referenced by other courses. If asset removal fails, the course may already be deleted." %}</div>
+    </div>
+  </fieldset>
+
+  <div class="submit-row">
+    <input type="submit" value="{% translate 'Delete course' %}">
+    <a href="{% url opts|admin_urlname:'changelist' %}" class="button cancel-link">{% translate "Cancel" %}</a>
+  </div>
+</form>
+{% endblock %}

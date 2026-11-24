@@ -2,7 +2,7 @@
 
 Custom Open edX plugins for the **Sherab / WeBuddhist Academy** platform, packaged
 together as a single installable distribution (`custom-extensions`). The package
-bundles six independent Django apps that plug into the LMS and/or CMS via the
+bundles seven independent Django apps that plug into the LMS and/or CMS via the
 [Open edX plugin framework](https://edx.readthedocs.io/projects/edx-django-utils/en/latest/edx_django_utils.plugins.html)
 (`edx_django_utils.plugins`) — no edx-platform core code is modified.
 
@@ -10,6 +10,7 @@ bundles six independent Django apps that plug into the LMS and/or CMS via the
 | --- | --- | --- |
 | [`ai_course_creator`](#ai_course_creator) | CMS (Studio) | Conversational AI ("Sherab") that designs and generates whole courses, and edits existing sections, using Google Gemini through OpenRouter. |
 | [`course_from_recording`](#course_from_recording) | CMS (Studio) | Jobs for the "From a teaching recording" tool: upload links, the studio tool service's queue, and progress. |
+| [`course_deletion`](#course_deletion) | CMS (Studio) | Delete courses from the Course Overview admin with enrollment counts and confirmation. |
 | [`course_schedule`](#course_schedule) | LMS + CMS | Per-section schedule (dates, times, instructor, tools, notes) set in the Studio outline and shown on the learner Dates tab. |
 | [`course_partnerships`](#course_partnerships) | LMS | Partner organizations, centers, categories, and course-creator profiles, with branding assets and a mobile API. |
 | [`user_extension`](#user_extension) | LMS | Extends user profiles with partner relationships; auto-approves ID verification on registration. |
@@ -37,7 +38,7 @@ and installed automatically by `setup.py`.
 The apps register through the entry points in [`setup.py`](setup.py):
 
 ```
-cms.djangoapp:  ai_course_creator, course_from_recording, course_partnerships, course_schedule, user_extension
+cms.djangoapp:  ai_course_creator, course_deletion, course_from_recording, course_partnerships, course_schedule, user_extension
 lms.djangoapp:  course_partnerships, course_schedule, user_extension, wishlist
 ```
 
@@ -49,6 +50,12 @@ tutor dev exec lms ./manage.py lms migrate course_partnerships
 ```
 
 ---
+
+## `course_deletion`
+
+The Studio Django Admin Course Overview list has a Delete course button for staff with the
+`course_overviews.delete_courseoverview` permission. The confirmation page displays active and
+total enrollments and requires the exact course ID. Asset removal is optional.
 
 ## `ai_course_creator`
 

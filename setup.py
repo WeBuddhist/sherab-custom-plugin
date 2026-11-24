@@ -51,7 +51,15 @@ setup(
     name="custom-extensions",
     version=__version__,
     packages=find_packages(),
-    package_data={"": ["*.html", "*.md", "skill/*.md", "skill/references/*.md"]},  # Mako templates + bundled skill prompt.
+    package_data={
+        "": [
+            "*.html",
+            "*.md",
+            "skill/*.md",
+            "skill/references/*.md",
+            "templates/admin/course_overviews/*.html",
+        ]
+    },  # Mako/admin templates + bundled skill prompt.
     include_package_data=True,
     license="Proprietary",
     description="Django plugin to enhance advanced/extra features.",
@@ -92,6 +100,7 @@ setup(
             "ai_course_creator = ai_course_creator.apps:AiCourseCreatorConfig",
             "course_schedule = course_schedule.apps:CourseScheduleConfig",
             "course_from_recording = course_from_recording.apps:CourseFromRecordingConfig",
+            "course_deletion = course_deletion.apps:CourseDeletionConfig",
         ],
     },
 )
