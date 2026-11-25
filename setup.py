@@ -93,6 +93,7 @@ setup(
             "user_extension = user_extension.apps:UserExtensionConfig",
             "wishlist = wishlist.apps:WishlistConfig",
             "course_schedule = course_schedule.apps:CourseScheduleConfig",
+            "offline_content = offline_content.apps:OfflineContentConfig",
         ],
         "cms.djangoapp": [
             "course_partnerships = course_partnerships.apps:CoursePartnershipsConfig",
